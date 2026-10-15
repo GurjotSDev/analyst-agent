@@ -1,3 +1,22 @@
+# --- Sensitive data: never commit ---
+data/
+output/
+
+# --- Python virtual environments (rebuilt by `uv sync`) ---
+.venv/
+
+# --- Python bytecode caches (created automatically when code runs) ---
+__pycache__/
+*.pyc
+
+# --- Logs and local secrets ---
+*.log
+.env
+
+# --- OS clutter ---
+Thumbs.db
+desktop.ini
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
