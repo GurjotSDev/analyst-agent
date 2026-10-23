@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from agent!")
+"""Local data analyst agent: model + sandboxed executor + the loop between them."""

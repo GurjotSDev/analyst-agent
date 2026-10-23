@@ -1,18 +1,19 @@
 [project]
 name = "agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local data analyst agent"
 readme = "README.md"
 authors = [
-    { name = "GurjotSDev", email = "har03gur@gmail.com" }
+    { name = "GurjotSDev", email = "" }
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "httpx>=0.28.1",
     "ollama>=0.6.3",
 ]
 
 [project.scripts]
-agent = "agent:main"
+analyst = "agent.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]

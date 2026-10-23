@@ -68,6 +68,6 @@ start = time.perf_counter()
 r = execute("x = bytearray(6 * 1024**3)")
 seconds = time.perf_counter() - start
 check("memory limit", r["status"] == "error" and r["kernel_restarted"] and seconds < 25,
-      f"{seconds:.0f}s, {(r['error'] or '')[:60]}")
+      f"{seconds:.0f}s, status={r['status']}, {(r['error'] or '')[:60]}")
 r = execute("print('alive')")
 check("usable after memory test", r["stdout"].strip() == "alive", repr(r["stdout"]))

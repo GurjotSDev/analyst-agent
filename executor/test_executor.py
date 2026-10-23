@@ -46,8 +46,34 @@ check("error", r["status"] == "error" and "ZeroDivisionError" in (r["error"] or 
       (r["error"] or "").splitlines()[-1])
 
 # 6. A chart comes back as a PNG and is saved with an ID.
-r = execute("import matplotlib.pyplot as plt\nplt.plot([1, 3, 2])\nplt.show()")
+r = execute("import matplotlib.pyplot as plt\n"
+            "fig, ax = plt.subplots()\n"
+            "ax.plot([1, 3, 2])\n"
+            "ax.set_title('Test chart')\n"
+            "ax.set_xlabel('Step')\n"
+            "ax.set_ylabel('Value')\n"
+            "plt.show()")
 check("chart", len(r["charts"]) == 1, str([c["id"] for c in r["charts"]]))
+# Delete the test chart so test runs don't leave files in output/charts.
+# The kernel's working folder is output/, so "charts/..." finds it both
+# locally and in Docker.
+for chart in r["charts"]:
+    execute(f"import os\nos.remove('charts/{chart['id']}.png')")
+
+# 6a. Charts still save if the charts folder was deleted while the server
+#     runs (by you on your PC, or by model code). This used to crash with
+#     FileNotFoundError and an HTTP 500.
+execute("import shutil\nshutil.rmtree('charts', ignore_errors=True)")
+r = execute("fig, ax = plt.subplots()\nax.plot([1, 2])\nax.set_title('T')\n"
+            "ax.set_xlabel('x')\nax.set_ylabel('y')\nplt.show()")
+check("chart after folder deleted", r["status"] == "ok" and len(r["charts"]) == 1, r["status"])
+for chart in r["charts"]:
+    execute(f"import os\nos.remove('charts/{chart['id']}.png')")
+
+# 6b. The house chart style is active (no top/right box lines, fixed colours).
+r = execute("import matplotlib.pyplot as plt\n"
+            "print(plt.rcParams['axes.spines.top'], plt.rcParams['axes.prop_cycle'].by_key()['color'][0])")
+check("chart style applied", r["stdout"].strip() == "False #2a78d6", repr(r["stdout"].strip() or r["error"]))
 
 # 7. Long-running code is stopped. Either the interrupt works and variables
 #    survive, or the server restarts the kernel and says so. Both are correct;
@@ -79,8 +105,19 @@ check("usable after restart", r["stdout"].strip() == "still working", repr(r["st
 r = execute("import pandas as pd\nprint(pd.__version__)")
 check("pandas 3", r["stdout"].startswith("3."), r["stdout"].strip())
 
+# 8b. The data-quality helpers are preloaded in every kernel.
+r = execute("print(callable(profile), callable(compare_keys), callable(merge_variants))")
+check("helpers preloaded", r["stdout"].strip() == "True True True", repr(r["stdout"].strip() or r["error"]))
+
+# 8c. pd, np and plt are preloaded too (the model's first chart failed without plt).
+r = execute("print(pd.__name__, np.__name__, plt.__name__)")
+check("pd/np/plt preloaded", r["stdout"].strip() == "pandas numpy matplotlib.pyplot",
+      repr(r["stdout"].strip() or r["error"]))
+
 # 9. Reset clears variables.
 execute("x = 41")
 httpx.post(f"{BASE}/reset", timeout=90).raise_for_status()
 r = execute("print(x)")
 check("reset clears state", r["status"] == "error" and "NameError" in (r["error"] or ""))
+r = execute("print(callable(profile))")
+check("helpers back after reset", r["stdout"].strip() == "True")

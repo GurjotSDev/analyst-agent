@@ -1,0 +1,71 @@
+# Runs the sandboxed executor. From the repo root:
+#   docker compose up -d --build    build (if needed) and start in the background
+#   docker compose logs -f          watch the server's output
+#   docker compose down             stop and remove the containers
+#
+# Two containers:
+#   executor  runs model-written code. Lives ONLY on the "sandbox" network,
+#             which has no route to the internet or to your PC.
+#   proxy     a one-purpose port forwarder. It's the only way into the sandbox:
+#             it relays 127.0.0.1:8000 on your PC to executor:8000, nothing else.
+
+services:
+  executor:
+    build: ./executor
+    networks: [sandbox]
+    environment:
+      EXECUTOR_SANDBOXED: "1"     # reported by /health; the agent checks it
+    volumes:
+      # Your folders, shared into the container. ":ro" = read-only, so model
+      # code can never change or delete your original CSVs.
+      - ./data:/data:ro
+      - ./output:/output
+    # --- Lockdown ---
+    read_only: true               # the container's own files can't be changed...
+    tmpfs:                        # ...except these scratch areas, kept in memory
+      - /tmp                      #    and wiped every time the container stops.
+      - /home/analyst:uid=1000,gid=1000,mode=700  # Jupyter and matplotlib keep small
+                                                  # files here; owned by the analyst user
+    cap_drop: [ALL]               # remove every special Linux privilege
+    security_opt:
+      - no-new-privileges:true    # and forbid regaining any (e.g. through sudo-like programs)
+    mem_limit: 4g                 # model code can't take more than 4 GB of RAM...
+    memswap_limit: 4g             # ...in total, counting swap. Without this Docker allows
+                                  # as much swap again (8 GB total) wherever swap exists,
+                                  # e.g. Docker Desktop on Windows (WSL2 has swap on by default).
+    cpus: 2                       # ...or more than 2 CPU cores
+    pids_limit: 256               # or start endless processes (a "fork bomb")
+    # Docker asks this every 10 s. "healthy" = the server answers /health.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped       # if the server crashes, Docker starts it again
+
+  proxy:
+    image: alpine/socat:1.8.0.0
+    # socat = "SOcket CAT": copies bytes between two connections. This says:
+    # listen on port 8000; for every incoming connection (fork), open one to
+    # executor:8000 and relay both ways. It can't be told to go anywhere else.
+    command: ["TCP-LISTEN:8000,fork,reuseaddr", "TCP:executor:8000"]
+    networks: [sandbox, outside]
+    ports:
+      # host-ip:host-port:container-port. Binding to 127.0.0.1 means only
+      # programs on this PC can connect, not other devices on your Wi-Fi.
+      - "127.0.0.1:8000:8000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      executor:
+        condition: service_healthy  # start only once the kernel is ready
+    restart: unless-stopped
+
+networks:
+  sandbox:
+    internal: true    # no gateway: nothing on this network can reach the internet or your PC
+  outside: {}         # an ordinary network, needed only so the port above can be published

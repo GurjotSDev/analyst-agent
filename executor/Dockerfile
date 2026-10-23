@@ -40,7 +40,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock .python-version ./
 RUN uv sync --locked --no-dev
 
-COPY server.py ./
+COPY server.py analyst_helpers.py ./
 
 # Put the project's virtual environment first on PATH, so `uvicorn` and the
 # kernel's `python` are the venv's. DATA_DIR / OUTPUT_DIR are the mount points

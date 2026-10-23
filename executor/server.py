@@ -10,42 +10,73 @@ Endpoints:
     POST /execute  run code, return its outputs
     POST /reset    restart the kernel with a clean slate
 
-Run locally:
+Run locally for development (NOT for model code; it has no sandbox):
     uv run uvicorn server:app --host 127.0.0.1 --port 8000
+Run sandboxed (stage 3), from the repo root:
+    docker compose up -d --build
 """
 
-import asyncio      
-import base64       
-import os           
-import re           
-from contextlib import asynccontextmanager  
-from pathlib import Path 
-from fastapi import FastAPI, HTTPException  
-from jupyter_client import AsyncKernelManager  
-from pydantic import BaseModel  
+import asyncio      # Python's built-in system for running async code. FastAPI is async,
+                    # and we use asyncio for timeouts and to allow one execution at a time.
+import base64       # Converts binary data (PNG bytes) to text and back. Kernels send
+                    # images as base64 text, because their messages are JSON.
+import os           # Reads environment variables, so settings can change without code edits.
+import queue        # Only for queue.Empty: the exception raised when no message arrives in time.
+import re           # Regular expressions; used to strip terminal color codes from tracebacks.
+from contextlib import asynccontextmanager  # Turns a function with `yield` into the
+                                            # setup/teardown pair FastAPI's lifespan expects.
+from pathlib import Path  # Object-oriented file paths that work on Windows and Linux alike.
+
+from fastapi import FastAPI, HTTPException  # The web framework, and its error response.
+from jupyter_client import AsyncKernelManager  # Starts, stops and restarts kernels.
+from pydantic import BaseModel  # Declares the shape of request/response JSON.
+                                # FastAPI uses it to validate input automatically.
 
 
 # --------------------------------------------------------------------------
 # Settings (environment variables, with defaults for running locally)
 # --------------------------------------------------------------------------
 
-# In Docker these become /data and /output. Locally they default to
+# In Docker these become /data and /output (stage 3). Locally they default to
 # the project's own data/ and output/ folders, one level above executor/.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", PROJECT_ROOT / "data"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", PROJECT_ROOT / "output"))
 CHARTS_DIR = OUTPUT_DIR / "charts"
 
+# Set to "1" only by compose.yaml, i.e. when running inside the locked-down
+# container. The agent refuses to send model code to an executor that doesn't
+# report this, so a server accidentally started on Windows is never used.
+SANDBOXED = os.environ.get("EXECUTOR_SANDBOXED") == "1"
+
 DEFAULT_TIMEOUT = 60        # seconds per execution, from the plan
 MAX_OUTPUT_CHARS = 100_000  # safety cap on returned text. The agent trims further
-                            # (to ~3,000) before sending anything to the model.
+                            # (to ~5,000) before sending anything to the model.
+
+# The folder holding this file and analyst_helpers.py.
+HERE = Path(__file__).resolve().parent
 
 # Runs once in every fresh kernel, before any model code.
-#   The inline backend is how Jupyter shows charts: each finished figure is
-#   sent back as a PNG instead of opening a window.
-KERNEL_SETUP = """
+#   - The inline backend is how Jupyter shows charts: each finished figure is
+#     sent back as a PNG instead of opening a window.
+#   - The kernel runs in output/, so Python wouldn't find analyst_helpers.py
+#     next to this file. sys.path is the list of folders Python searches when
+#     importing; adding ours makes `from analyst_helpers import ...` work.
+#     {str(HERE)!r} puts the path in as a quoted Python string.
+#   - apply_chart_style() sets readable chart defaults (see analyst_helpers.py).
+#   - pd, np and plt are imported up front, under the names everyone uses.
+#     The prompt tells the model to call plt.subplots(); without this import
+#     its first chart failed with "name 'plt' is not defined".
+KERNEL_SETUP = f"""
+import sys
+sys.path.insert(0, {str(HERE)!r})
 import matplotlib
 matplotlib.use("module://matplotlib_inline.backend_inline")
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from analyst_helpers import profile, compare_keys, merge_variants, apply_chart_style
+apply_chart_style()
 """
 
 # Terminal color codes look like "\x1b[0;31m". Tracebacks from the kernel
@@ -82,6 +113,11 @@ class ExecuteResponse(BaseModel):
 # The kernel
 # --------------------------------------------------------------------------
 
+class KernelDied(Exception):
+    """The kernel process ended while we were waiting for its output.
+    Almost always the memory limit: Linux kills a process that exceeds it."""
+
+
 class Kernel:
     """Owns one Jupyter kernel and runs code in it, one request at a time."""
 
@@ -96,6 +132,13 @@ class Kernel:
     async def start(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         CHARTS_DIR.mkdir(parents=True, exist_ok=True)
+        # Continue numbering after any charts already saved, so a restarted
+        # server or container never overwrites chart_001.png and friends.
+        # glob() finds matching files; stem is the name without ".png";
+        # [6:] cuts off "chart_", leaving the number.
+        existing = [int(p.stem[6:]) for p in CHARTS_DIR.glob("chart_*.png")
+                    if p.stem[6:].isdigit()]
+        self.chart_count = max([self.chart_count, *existing])
 
         # "python3" is the kernel ipykernel registers, using this same Python.
         # The server and kernel talk over ports on 127.0.0.1 (this machine
@@ -150,6 +193,15 @@ class Kernel:
             return await asyncio.wait_for(self._collect(msg_id), timeout)
         except TimeoutError:
             pass
+        except KernelDied:
+            await self._restart()
+            return ExecuteResponse(
+                status="error",
+                kernel_restarted=True,
+                error="The kernel crashed while running this code, most likely because "
+                      "it ran out of memory. It was restarted: all variables and imports "
+                      "are gone and files must be loaded again. Use less memory, e.g. load "
+                      "only the needed columns (usecols=...) or process data in chunks.")
 
         # Too slow: ask the kernel to stop the code (Jupyter's stop button).
         await self.manager.interrupt_kernel()
@@ -179,7 +231,16 @@ class Kernel:
 
         while True:
             # The "iopub" channel is where the kernel broadcasts all outputs.
-            msg = await self.client.get_iopub_msg()
+            # Wait at most 1 second per message, so that while code runs quietly
+            # we regularly check the kernel is still alive. Without this, a
+            # kernel killed for using too much memory would leave us waiting
+            # for messages that never come, until the full timeout.
+            try:
+                msg = await self.client.get_iopub_msg(timeout=1)
+            except queue.Empty:
+                if not await self.manager.is_alive():
+                    raise KernelDied()
+                continue
             if msg["parent_header"].get("msg_id") != msg_id:
                 continue  # left over from an earlier request; ignore it
             kind, content = msg["msg_type"], msg["content"]
@@ -223,13 +284,18 @@ class Kernel:
         try:
             await asyncio.wait_for(self._collect(msg_id), 10)
             return True
-        except TimeoutError:
+        except (TimeoutError, KernelDied):
             return False
 
     def _save_chart(self, png_base64: str) -> Chart:
         """Write a chart to output/charts/ and give it a stable ID."""
         self.chart_count += 1
         chart_id = f"chart_{self.chart_count:03d}"  # :03d pads to 3 digits: 001, 002...
+        # Create the folder EVERY time, not just at startup: output/ is shared
+        # with your PC and writable by model code, so charts/ can be deleted
+        # while the server runs (which caused a crash). exist_ok=True makes
+        # this a no-op when the folder is already there.
+        CHARTS_DIR.mkdir(parents=True, exist_ok=True)
         (CHARTS_DIR / f"{chart_id}.png").write_bytes(base64.b64decode(png_base64))
         return Chart(id=chart_id, png_base64=png_base64)
 
@@ -255,7 +321,8 @@ app = FastAPI(title="Analyst executor", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok" if await kernel.is_alive() else "dead"}
+    return {"status": "ok" if await kernel.is_alive() else "dead",
+            "sandboxed": SANDBOXED}
 
 
 @app.post("/execute", response_model=ExecuteResponse)
