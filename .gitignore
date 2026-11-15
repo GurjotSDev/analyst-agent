@@ -1,6 +1,7 @@
 # --- Sensitive data: never commit ---
 data/
 output/
+CLAUDE.md
 
 # --- Python virtual environments (rebuilt by `uv sync`) ---
 .venv/

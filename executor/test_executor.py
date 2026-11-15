@@ -1,7 +1,7 @@
 """
-Stage 2 checks for the executor server. Start the server first, in another terminal:
-    uv run uvicorn server:app --host 127.0.0.1 --port 8000
-Then run:
+Checks for the executor server, through the same HTTP address the agent uses.
+Needs the sandbox running (from the repo root: docker compose up -d).
+Run from executor/:
     uv run python test_executor.py
 """
 
@@ -45,35 +45,10 @@ r = execute("1 / 0")
 check("error", r["status"] == "error" and "ZeroDivisionError" in (r["error"] or ""),
       (r["error"] or "").splitlines()[-1])
 
-# 6. A chart comes back as a PNG and is saved with an ID.
-r = execute("import matplotlib.pyplot as plt\n"
-            "fig, ax = plt.subplots()\n"
-            "ax.plot([1, 3, 2])\n"
-            "ax.set_title('Test chart')\n"
-            "ax.set_xlabel('Step')\n"
-            "ax.set_ylabel('Value')\n"
-            "plt.show()")
-check("chart", len(r["charts"]) == 1, str([c["id"] for c in r["charts"]]))
-# Delete the test chart so test runs don't leave files in output/charts.
-# The kernel's working folder is output/, so "charts/..." finds it both
-# locally and in Docker.
-for chart in r["charts"]:
-    execute(f"import os\nos.remove('charts/{chart['id']}.png')")
-
-# 6a. Charts still save if the charts folder was deleted while the server
-#     runs (by you on your PC, or by model code). This used to crash with
-#     FileNotFoundError and an HTTP 500.
-execute("import shutil\nshutil.rmtree('charts', ignore_errors=True)")
-r = execute("fig, ax = plt.subplots()\nax.plot([1, 2])\nax.set_title('T')\n"
-            "ax.set_xlabel('x')\nax.set_ylabel('y')\nplt.show()")
-check("chart after folder deleted", r["status"] == "ok" and len(r["charts"]) == 1, r["status"])
-for chart in r["charts"]:
-    execute(f"import os\nos.remove('charts/{chart['id']}.png')")
-
-# 6b. The house chart style is active (no top/right box lines, fixed colours).
-r = execute("import matplotlib.pyplot as plt\n"
-            "print(plt.rcParams['axes.spines.top'], plt.rcParams['axes.prop_cycle'].by_key()['color'][0])")
-check("chart style applied", r["stdout"].strip() == "False #2a78d6", repr(r["stdout"].strip() or r["error"]))
+# 6. No chart libraries in the sandbox: this is a cleanup bot, and anything
+#    the model can't use, it can't misuse.
+r = execute("import matplotlib")
+check("no matplotlib", r["status"] == "error" and "ModuleNotFoundError" in (r["error"] or ""))
 
 # 7. Long-running code is stopped. Either the interrupt works and variables
 #    survive, or the server restarts the kernel and says so. Both are correct;
@@ -109,10 +84,20 @@ check("pandas 3", r["stdout"].startswith("3."), r["stdout"].strip())
 r = execute("print(callable(profile), callable(compare_keys), callable(merge_variants))")
 check("helpers preloaded", r["stdout"].strip() == "True True True", repr(r["stdout"].strip() or r["error"]))
 
-# 8c. pd, np and plt are preloaded too (the model's first chart failed without plt).
-r = execute("print(pd.__name__, np.__name__, plt.__name__)")
-check("pd/np/plt preloaded", r["stdout"].strip() == "pandas numpy matplotlib.pyplot",
-      repr(r["stdout"].strip() or r["error"]))
+# 8b2. So are the fix helpers and their change log (cleaning.py).
+r = execute("print(callable(load), callable(drop_rows), callable(save_clean), callable(custom_fix))")
+check("fix helpers preloaded", r["stdout"].strip() == "True True True True", repr(r["stdout"].strip() or r["error"]))
+
+# 8c. pd and np are preloaded too, under their usual names.
+r = execute("print(pd.__name__, np.__name__)")
+check("pd/np preloaded", r["stdout"].strip() == "pandas numpy", repr(r["stdout"].strip() or r["error"]))
+
+# 8d. Every response says which kernel ran it; a reset starts a new one.
+before = httpx.get(f"{BASE}/health").json()["kernel"]
+ran_in = execute("print(1)")["kernel"]
+after = httpx.post(f"{BASE}/reset", timeout=90).json()["kernel"]
+check("kernel numbered", ran_in == before and after == before + 1 and
+      httpx.get(f"{BASE}/health").json()["kernel"] == after, f"{before} -> {after}")
 
 # 9. Reset clears variables.
 execute("x = 41")

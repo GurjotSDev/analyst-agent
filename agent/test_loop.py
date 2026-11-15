@@ -132,38 +132,7 @@ try:
 except ExecutorNotSafe:
     check("refuses unsandboxed executor", True)
 
-# 11. Charts without a title or axis labels: the model is told to redraw.
-from agent.loop import missing_chart_parts
-
-bare = "import matplotlib.pyplot as plt\nfig, ax = plt.subplots()\nax.bar(['a', 'b'], [3, 5])\nplt.show()"
-agent, llm = new_agent([py(bare), "Done."], require_approval=False)
-events = list(agent.send("go"))
-seen = llm.seen[1][-1]["content"]
-check("unlabelled chart flagged", "missing a title and an x-axis label and a y-axis label" in seen)
-check("user told about redraw", any(isinstance(e, Notice) and "redraw" in e.text for e in events))
-# Delete charts the tests created.
-for e in events:
-    if isinstance(e, CodeResult):
-        for c in e.result["charts"]:
-            executor.execute(f"import os\nos.remove('charts/{c['id']}.png')")
-
-labelled = bare.replace("plt.show()", "ax.set_title('B is largest')\nax.set_xlabel('Group')\n"
-                                      "ax.set_ylabel('Count')\nplt.show()")
-agent, llm = new_agent([py(labelled), "Done."], require_approval=False)
-events = list(agent.send("go"))
-check("labelled chart not flagged", "missing" not in llm.seen[1][-1]["content"])
-for e in events:
-    if isinstance(e, CodeResult):
-        for c in e.result["charts"]:
-            executor.execute(f"import os\nos.remove('charts/{c['id']}.png')")
-
-# The text check itself, on the other common ways to set labels:
-check("ax.set(...) counts", missing_chart_parts("ax.set(title='T', xlabel='x', ylabel='y')") == [])
-check("df.plot(title=...) counts", missing_chart_parts("df.plot(title='T', xlabel='x', ylabel='y')") == [])
-check("plt.title(...) counts", missing_chart_parts("plt.title('T'); plt.xlabel('x'); plt.ylabel('y')") == [])
-check("'subtitle' is not a title", "a title" in missing_chart_parts("subtitle_text = 'x'"))
-
-# 12. The same error over and over: nudge on the 3rd, stop on the 5th.
+# 11. The same error over and over: nudge on the 3rd, stop on the 5th.
 from agent.loop import NUDGE_AT, STOP_AT, error_signature
 
 failing = py("df = pd.DataFrame({'a': [1]})\ndf['missing_col']")
@@ -186,7 +155,7 @@ check("error fingerprint", error_signature({"status": "error", "error": "Traceba
 check("sandbox failures not counted", error_signature(
     {"status": "error", "error": "x", "executor_failure": True}) is None)
 
-# 13. Sandbox failures come back as results, never as a crash.
+# 12. Sandbox failures come back as results, never as a crash.
 def fake_server(status: int):
     def answer(request):
         if request.url.path == "/health":
@@ -210,6 +179,118 @@ check("loop survives a sandbox failure", events[-1] == TurnDone("answered"))
 check("user told about sandbox failure", any(isinstance(e, Notice) and "Sandbox problem" in e.text
                                               for e in events))
 
-# 14. shorten() keeps the start and the end.
+# 13. shorten() keeps the start and the end.
 s = shorten("A" * 100 + "Z" * 100, 60)
 check("shorten keeps both ends", s.startswith("A") and s.endswith("Z"))
+
+# 13b. A long report loses detail lines, never checklist lines: in a test with
+#      two wide tables, plain shorten() cut most of the first "Issues to report".
+from agent.executor import shorten_report
+report = "\n".join(["load: a = a.csv, 26 rows", "=== a: 26 rows x 30 columns ==="]
+                   + [f"col{i}: 'x' 5, 'y' 3, 'z' 1, plus a long list of example values {i}" for i in range(60)]
+                   + ["Issues to report (3):", "  1. col1: 2 values with stray spaces",
+                      "  2. day_rate: likely an error: 1 value (75,000)", "  3. start_date: impossible dates: 1 value"]
+                   + ["=== b: 76 rows x 5 columns ==="]
+                   + [f"det{i}: lots of detail about this column {i}" * 2 for i in range(40)]
+                   + ["Issues to report (1):", "  1. week_start: 1 date in the future, latest 2030-03-02"])
+kept = shorten_report(report, 2500)
+check("report: fits the limit", len(kept) <= 2600, f"{len(kept)} chars")
+check("report: every issue line kept", all(line in kept for line in report.splitlines()
+                                            if line.startswith("  ") and ". " in line[:6]))
+check("report: headers and load kept", "=== b: 76 rows" in kept and kept.startswith("load: a"))
+check("report: cut marked", "detail lines cut; every 'Issues to report' line is kept" in kept)
+check("plain output: old cut", "characters cut" in shorten_report("x" * 9000, 5000))
+
+# 14. A plain answer ends the turn, figures or not: the counts come from
+#     check()'s report, so the model is never made to recompute them.
+agent, llm = new_agent(["The salary of 1,250,000 is likely an error."], require_approval=False)
+events = list(agent.send("Which salary is wrong?"))
+check("answer without code ends the turn", len(llm.seen) == 1 and events[-1] == TurnDone("answered"))
+
+# 15. Invented results after a code block never reach the history.
+fake = ("```python\nprint('real')\n```\n\n[Execution result]\n```\nexpenses: 150 rows\n```\n\n"
+        "So there are 150 rows.\n\n```python\nprint('second')\n```")
+agent, llm = new_agent([fake, "Done."], require_approval=False)
+events = list(agent.send("go"))
+stored = agent.history[2]["content"]
+check("reply cut after first block", stored.endswith("```") and "150 rows" not in stored, repr(stored[-30:]))
+check("user sees the cut reply too", all("150 rows" not in e.text for e in events if isinstance(e, ModelReply)))
+check("model told why", "everything after it was removed" in llm.seen[1][-1]["content"])
+
+one_block = "```python\nprint('saving')\n```\nSaved all files to output/clean."
+agent, llm = new_agent([one_block, "Done."], require_approval=False)
+list(agent.send("go"))
+check("invented summary after one block cut", "Saved all files" not in agent.history[2]["content"])
+check("model told not to write results", "Never write results" in llm.seen[1][-1]["content"])
+
+agent, llm = new_agent([fake, "Done."])               # approval mode: note still delivered
+list(agent.send("go"))
+list(agent.resume(approved=True))
+check("note delivered in approval mode", "everything after it was removed" in llm.seen[1][-1]["content"])
+
+agent, llm = new_agent(["Plain answer, no code. It has 3 parts.", "x"], require_approval=False)
+list(agent.send("go"))
+check("reply without code kept whole", agent.history[2]["content"] == "Plain answer, no code. It has 3 parts.")
+
+# 16. Another program resets the shared kernel mid-conversation: the code is
+#     NOT run, the model is told why, and the next block runs normally.
+agent, llm = new_agent([py("x = 5"), "Set.", py("print(x)"),
+                        py("x = 5\nprint('reloaded', x)"), "Done."], require_approval=False)
+list(agent.send("set x"))
+executor.reset()                                   # "the tests", from outside
+events = list(agent.send("print x"))
+results = [e for e in events if isinstance(e, CodeResult)]
+check("code not run after outside reset", "NOT run" in (results[0].result["error"] or ""))
+check("model told to load again", "another program reset" in results[0].model_text)
+check("user told", any(isinstance(e, Notice) and "Another program" in e.text for e in events))
+check("next block runs in the new kernel", "reloaded 5" in results[1].result["stdout"])
+agent, llm = new_agent([py("print(1)"), "ok"], require_approval=False)   # its own reset only
+events = list(agent.send("go"))
+check("own reset is not 'another program'", not any(isinstance(e, Notice) and "Another program" in e.text
+                                                    for e in events))
+# 18. An error part-way through a block: the model is told which fixes already
+#     ran, so it continues from the failing line instead of repeating them.
+from agent.loop import applied_note
+failed = {"status": "error", "error": "CleaningError: not real dates",
+          "stdout": "[4] t: strip_spaces 'name': 2 cells changed\n[5] t: to_numbers 'rate': 9 cells changed\n"}
+check("applied note: names the fixes", "2 fixes ran and were logged ([4] to [5] above)" in applied_note(failed),
+      applied_note(failed))
+check("applied note: one fix", "1 fix ran and was logged ([4] above)" in applied_note(
+      {**failed, "stdout": "[4] t: strip_spaces 'name': 2 cells changed\n"}))
+check("applied note: none when nothing was logged", applied_note({**failed, "stdout": "load: t, 5 rows\n"}) == "")
+check("applied note: none on success", applied_note({**failed, "status": "ok"}) == "")
+agent, llm = new_agent([py("print('[1] t: drop_rows: 1 row removed')\nraise ValueError('boom')"), "ok"],
+                       require_approval=False)
+list(agent.send("go"))
+check("applied note reaches the model", "don't run them again" in llm.seen[1][-1]["content"])
+
+# 19. A reply that says the files were saved, when save_clean() never ran
+#     since the last change: the model is told, once, and gets to save.
+fix = py("print('[1] t: drop_rows: 1 row removed')")
+agent, llm = new_agent([fix, "Done. The files have been saved to output/clean/.",
+                        py("print('save_clean: clean/t.csv, 4 rows')"), "Saved: clean/t.csv."],
+                       require_approval=False)
+events = list(agent.send("fix and save"))
+check("false 'saved' caught", "save_clean() has not run since the last change" in llm.seen[2][-1]["content"])
+check("user told about it", any(isinstance(e, Notice) and "hadn't run" in e.text for e in events))
+check("model then saved", agent.unsaved is False and events[-1] == TurnDone("answered"))
+agent, llm = new_agent([fix, "The files have been saved.", "Sorry, nothing was saved yet."],
+                       require_approval=False)
+events = list(agent.send("go"))
+check("checked once per turn, no loop", sum(isinstance(e, Notice) for e in events) == 1
+      and events[-1] == TurnDone("answered"))
+agent, llm = new_agent([py("print('[1] t: x\\nsave_clean: clean/t.csv')"), "The files have been saved."],
+                       require_approval=False)
+events = list(agent.send("go"))
+check("real save: no false alarm", not any(isinstance(e, Notice) for e in events))
+agent, llm = new_agent([fix, "Once you approve, the files will be saved."], require_approval=False)
+check("a promise to save is not a claim", not any(isinstance(e, Notice) for e in agent.send("go")))
+
+# 17. An outside reset before ANY of our code ran: nothing was lost, so the
+#     code just runs in the new kernel, with no warning and no second approval.
+agent, llm = new_agent([py("print('first run')"), "ok"], require_approval=False)
+executor.reset()
+events = list(agent.send("go"))
+results = [e for e in events if isinstance(e, CodeResult)]
+check("reset before first run: code runs", "first run" in results[0].result["stdout"])
+check("reset before first run: no warning", not any(isinstance(e, Notice) for e in events))

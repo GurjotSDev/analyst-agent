@@ -1,13 +1,16 @@
-# Runs the sandboxed executor. From the repo root:
+# Runs the cleanup bot: the sandbox, and the web UI. From the repo root:
 #   docker compose up -d --build    build (if needed) and start in the background
 #   docker compose logs -f          watch the server's output
 #   docker compose down             stop and remove the containers
 #
-# Two containers:
+# Three containers:
 #   executor  runs model-written code. Lives ONLY on the "sandbox" network,
 #             which has no route to the internet or to your PC.
-#   proxy     a one-purpose port forwarder. It's the only way into the sandbox:
-#             it relays 127.0.0.1:8000 on your PC to executor:8000, nothing else.
+#   proxy     a one-purpose port forwarder. It's the only way into the sandbox
+#             from your PC: it relays 127.0.0.1:8000 to executor:8000. The CLI
+#             and the eval use it.
+#   ui        the web app, at http://127.0.0.1:7860. It talks to the executor
+#             directly over the sandbox network, and to Ollama on your PC.
 
 services:
   executor:
@@ -24,8 +27,8 @@ services:
     read_only: true               # the container's own files can't be changed...
     tmpfs:                        # ...except these scratch areas, kept in memory
       - /tmp                      #    and wiped every time the container stops.
-      - /home/analyst:uid=1000,gid=1000,mode=700  # Jupyter and matplotlib keep small
-                                                  # files here; owned by the analyst user
+      - /home/analyst:uid=1000,gid=1000,mode=700  # Jupyter keeps small files here;
+                                                  # owned by the analyst user
     cap_drop: [ALL]               # remove every special Linux privilege
     security_opt:
       - no-new-privileges:true    # and forbid regaining any (e.g. through sudo-like programs)
@@ -63,6 +66,44 @@ services:
     depends_on:
       executor:
         condition: service_healthy  # start only once the kernel is ready
+    restart: unless-stopped
+
+  ui:
+    build: ./agent
+    # sandbox: to reach executor:8000 directly. outside: to reach Ollama on
+    # your PC and to publish the port. That also lets this container reach the
+    # internet: accepted, because it runs only our own code (Gradio analytics
+    # off). The model's code still runs only in the executor, with no internet.
+    networks: [sandbox, outside]
+    environment:
+      # Where things are, from inside this container (config.py reads these).
+      # Running the UI on Windows instead needs none of them: the defaults are
+      # the Windows locations.
+      ANALYST_EXECUTOR_URL: http://executor:8000
+      ANALYST_OLLAMA_HOST: http://host.docker.internal:11434   # Docker's name for your PC
+      ANALYST_DATA_DIR: /data
+      ANALYST_OUTPUT_DIR: /output
+      ANALYST_UI_HOST: 0.0.0.0     # all interfaces INSIDE the container; see ports
+    # Docker Desktop (Windows, Mac) knows host.docker.internal by itself; this
+    # line makes the same name work on Linux too.
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ./data:/data               # writable HERE (uploads go to data/uploads/); still
+                                   # read-only for the executor, which runs the model's code
+      - ./output:/output:ro        # cleaned files and reports, for downloading
+    ports:
+      - "127.0.0.1:7860:7860"      # only programs on this PC can open the UI
+    read_only: true
+    tmpfs:
+      - /tmp                       # Gradio's upload cache: in memory, never on disk
+      - /home/app:uid=1000,gid=1000,mode=700
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    depends_on:
+      executor:
+        condition: service_healthy
     restart: unless-stopped
 
 networks:

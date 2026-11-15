@@ -21,6 +21,20 @@ def extract_code(reply: str) -> list[str]:
     return [code.strip() for code in CODE_BLOCK.findall(reply) if code.strip()]
 
 
+def trim_after_first_block(reply: str) -> tuple[str, str]:
+    """Split a reply at the end of its first code block: (kept, cut).
+
+    Anything after the first block was written before any code ran, so it
+    can only be a guess. In testing, a model wrote three blocks, each followed
+    by an invented [Execution result] (wrong row counts, made-up IDs), and
+    later believed its own inventions. Cutting them keeps the history to real
+    results only. A reply without a code block is kept whole."""
+    match = CODE_BLOCK.search(reply)
+    if not match:
+        return reply, ""
+    return reply[:match.end()], reply[match.end():].strip()
+
+
 def assistant_message(reply: str) -> dict:
     """The model's reply, as stored in the history."""
     return {"role": "assistant", "content": reply}

@@ -3,18 +3,14 @@ name = "executor"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-authors = [
-    { name = "GurjotSDev", email = "" }
-]
 requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.143.1",
+    "fpdf2>=2.9.0",
     "ipykernel>=7.4.0",
     "jupyter-client>=8.10.0",
-    "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "pandas>=3.0.6",
-    "seaborn>=0.13.2",
     "uvicorn>=0.54.0",
 ]
 

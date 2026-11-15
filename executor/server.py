@@ -2,7 +2,7 @@
 Executor server: runs model-written Python in a persistent Jupyter kernel.
 
 The agent sends code over HTTP; this server runs it in the kernel and sends
-back what happened (printed text, errors, charts). In stage 3 this whole file
+back what happened (printed text and errors). In stage 3 this whole file
 runs inside the Docker container, so the code it executes is sandboxed.
 
 Endpoints:
@@ -18,8 +18,6 @@ Run sandboxed (stage 3), from the repo root:
 
 import asyncio      # Python's built-in system for running async code. FastAPI is async,
                     # and we use asyncio for timeouts and to allow one execution at a time.
-import base64       # Converts binary data (PNG bytes) to text and back. Kernels send
-                    # images as base64 text, because their messages are JSON.
 import os           # Reads environment variables, so settings can change without code edits.
 import queue        # Only for queue.Empty: the exception raised when no message arrives in time.
 import re           # Regular expressions; used to strip terminal color codes from tracebacks.
@@ -42,7 +40,6 @@ from pydantic import BaseModel  # Declares the shape of request/response JSON.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", PROJECT_ROOT / "data"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", PROJECT_ROOT / "output"))
-CHARTS_DIR = OUTPUT_DIR / "charts"
 
 # Set to "1" only by compose.yaml, i.e. when running inside the locked-down
 # container. The agent refuses to send model code to an executor that doesn't
@@ -57,26 +54,23 @@ MAX_OUTPUT_CHARS = 100_000  # safety cap on returned text. The agent trims furth
 HERE = Path(__file__).resolve().parent
 
 # Runs once in every fresh kernel, before any model code.
-#   - The inline backend is how Jupyter shows charts: each finished figure is
-#     sent back as a PNG instead of opening a window.
 #   - The kernel runs in output/, so Python wouldn't find analyst_helpers.py
 #     next to this file. sys.path is the list of folders Python searches when
 #     importing; adding ours makes `from analyst_helpers import ...` work.
 #     {str(HERE)!r} puts the path in as a quoted Python string.
-#   - apply_chart_style() sets readable chart defaults (see analyst_helpers.py).
-#   - pd, np and plt are imported up front, under the names everyone uses.
-#     The prompt tells the model to call plt.subplots(); without this import
-#     its first chart failed with "name 'plt' is not defined".
+#   - pd and np are imported up front, under the names everyone uses, so the
+#     model's first block can't fail with "name 'pd' is not defined".
+#   - The finding helpers (analyst_helpers.py) and the fix helpers with their
+#     change log (cleaning.py) are imported by name, ready to call.
 KERNEL_SETUP = f"""
 import sys
 sys.path.insert(0, {str(HERE)!r})
-import matplotlib
-matplotlib.use("module://matplotlib_inline.backend_inline")
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from analyst_helpers import profile, compare_keys, merge_variants, apply_chart_style
-apply_chart_style()
+from analyst_helpers import profile, compare_keys, check
+from cleaning import (load, current, undo, drop_duplicates, drop_rows, set_missing,
+                      fill_missing, merge_variants, strip_spaces, placeholders_to_missing,
+                      to_numbers, to_dates, custom_fix, show_log, save_clean, CleaningError)
 """
 
 # Terminal color codes look like "\x1b[0;31m". Tracebacks from the kernel
@@ -93,20 +87,15 @@ class ExecuteRequest(BaseModel):
     timeout: float = DEFAULT_TIMEOUT
 
 
-class Chart(BaseModel):
-    id: str           # e.g. "chart_003", used by the final report to refer to it
-    png_base64: str   # the image itself, for the UI to display
-
-
 class ExecuteResponse(BaseModel):
     status: str                 # "ok", "error" or "timeout"
     stdout: str = ""            # printed output, plus the value of the last line
     stderr: str = ""            # warnings and anything printed to stderr
     error: str | None = None    # a clean traceback when status is "error"
-    charts: list[Chart] = []
     truncated: bool = False     # True if stdout was cut at MAX_OUTPUT_CHARS
     kernel_restarted: bool = False  # True if a stuck kernel was replaced; the
                                     # agent must tell the model its state is gone
+    kernel: int = 0             # which kernel ran this (see Kernel.generation)
 
 
 # --------------------------------------------------------------------------
@@ -124,21 +113,18 @@ class Kernel:
     def __init__(self) -> None:
         self.manager: AsyncKernelManager | None = None
         self.client = None
-        self.chart_count = 0
+        # Counts kernel starts: 1 for the first, +1 for every reset, crash or
+        # stuck-code restart. Every program using this sandbox (the UI, the
+        # CLI, the eval, the tests) shares ONE kernel, so a client compares
+        # this number with the one it got from its own reset: if it changed,
+        # someone else reset the kernel and its tables are gone.
+        self.generation = 0
         # A lock lets only one execution run at a time. Two requests sharing a
         # kernel at once would mix up their outputs.
         self.lock = asyncio.Lock()
 
     async def start(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        CHARTS_DIR.mkdir(parents=True, exist_ok=True)
-        # Continue numbering after any charts already saved, so a restarted
-        # server or container never overwrites chart_001.png and friends.
-        # glob() finds matching files; stem is the name without ".png";
-        # [6:] cuts off "chart_", leaving the number.
-        existing = [int(p.stem[6:]) for p in CHARTS_DIR.glob("chart_*.png")
-                    if p.stem[6:].isdigit()]
-        self.chart_count = max([self.chart_count, *existing])
 
         # "python3" is the kernel ipykernel registers, using this same Python.
         # The server and kernel talk over ports on 127.0.0.1 (this machine
@@ -153,6 +139,7 @@ class Kernel:
         self.client.start_channels()  # opens the connections to the kernel
         await self.client.wait_for_ready(timeout=60)
         await self._execute(KERNEL_SETUP, timeout=30)
+        self.generation += 1
 
     async def stop(self) -> None:
         if self.client:
@@ -166,7 +153,6 @@ class Kernel:
             await self._restart()
 
     async def _restart(self) -> None:
-        # chart_count is NOT reset, so new charts never overwrite earlier files.
         await self.stop()
         await self.start()
 
@@ -176,7 +162,9 @@ class Kernel:
     async def run(self, code: str, timeout: float) -> ExecuteResponse:
         """Run code for a request. The lock makes other requests wait their turn."""
         async with self.lock:
-            return await self._execute(code, timeout)
+            response = await self._execute(code, timeout)
+            response.kernel = self.generation   # after any restart _execute did
+            return response
 
     async def _execute(self, code: str, timeout: float) -> ExecuteResponse:
         """Send code to the kernel and collect everything it produces.
@@ -226,7 +214,7 @@ class Kernel:
 
     async def _collect(self, msg_id: str) -> ExecuteResponse:
         """Read output messages until the kernel reports it's idle again."""
-        stdout, stderr, charts = [], [], []
+        stdout, stderr = [], []
         error = None
 
         while True:
@@ -251,13 +239,11 @@ class Kernel:
 
             elif kind in ("execute_result", "display_data"):
                 # execute_result = the value of the last line (like df.head()).
-                # display_data = something shown explicitly, e.g. a chart.
-                # Both carry several formats of the same thing; we take the PNG
-                # if there is one, else the plain-text version.
+                # display_data = something shown explicitly with display().
+                # Both can carry several formats of the same thing (plain text,
+                # HTML...); the model reads text, so we keep the plain version.
                 data = content["data"]
-                if "image/png" in data:
-                    charts.append(self._save_chart(data["image/png"]))
-                elif "text/plain" in data:
+                if "text/plain" in data:
                     stdout.append(data["text/plain"] + "\n")
 
             elif kind == "error":
@@ -273,7 +259,6 @@ class Kernel:
             stdout=text[:MAX_OUTPUT_CHARS],
             stderr="".join(stderr)[:MAX_OUTPUT_CHARS],
             error=error,
-            charts=charts,
             truncated=truncated,
         )
 
@@ -286,18 +271,6 @@ class Kernel:
             return True
         except (TimeoutError, KernelDied):
             return False
-
-    def _save_chart(self, png_base64: str) -> Chart:
-        """Write a chart to output/charts/ and give it a stable ID."""
-        self.chart_count += 1
-        chart_id = f"chart_{self.chart_count:03d}"  # :03d pads to 3 digits: 001, 002...
-        # Create the folder EVERY time, not just at startup: output/ is shared
-        # with your PC and writable by model code, so charts/ can be deleted
-        # while the server runs (which caused a crash). exist_ok=True makes
-        # this a no-op when the folder is already there.
-        CHARTS_DIR.mkdir(parents=True, exist_ok=True)
-        (CHARTS_DIR / f"{chart_id}.png").write_bytes(base64.b64decode(png_base64))
-        return Chart(id=chart_id, png_base64=png_base64)
 
 
 kernel = Kernel()
@@ -321,7 +294,7 @@ app = FastAPI(title="Analyst executor", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok" if await kernel.is_alive() else "dead",
+    return {"status": "ok" if await kernel.is_alive() else "dead", "kernel": kernel.generation,
             "sandboxed": SANDBOXED}
 
 
@@ -337,4 +310,4 @@ async def execute(request: ExecuteRequest):
 @app.post("/reset")
 async def reset():
     await kernel.restart()
-    return {"status": "ok"}
+    return {"status": "ok", "kernel": kernel.generation}

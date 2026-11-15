@@ -1,0 +1,11 @@
+# Files Docker never sends into the build. Keeps the image small, the build
+# fast, and stops a local .venv (built for Windows) from leaking into a Linux image.
+.venv/
+__pycache__/
+*.pyc
+*.log
+.git/
+.gitignore
+test_*.py
+evals/
+Dockerfile

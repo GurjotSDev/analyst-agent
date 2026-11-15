@@ -4,7 +4,7 @@ The agent loop: model writes code -> sandbox runs it -> model reads the result
 
 The loop reports what happens as a stream of EVENTS (small objects like
 "the model said this", "code ran, here's the result"). It doesn't print or
-draw anything itself. The terminal (cli.py) and later the Gradio UI just
+draw anything itself. The terminal (cli.py) and the web UI (session.py) just
 display events, so neither needs to know how the loop works.
 """
 
@@ -14,17 +14,6 @@ from dataclasses import dataclass, field
 
 from . import codeblocks
 from .executor import ExecutorClient, format_for_model
-
-# Ways matplotlib/pandas code can set each chart part: a function call like
-# ax.set_title(...) / plt.title(...) / fig.suptitle(...), or a keyword like
-# df.plot(title=...) / ax.set(xlabel=...). \b = a word boundary, so "title"
-# doesn't match inside e.g. "subtitle_text". \s* allows spaces before ( or =.
-CHART_PARTS = {
-    "a title": re.compile(r"\b(set_title|suptitle|title)\s*[(=]"),
-    "an x-axis label": re.compile(r"\b(set_xlabel|xlabel)\s*[(=]"),
-    "a y-axis label": re.compile(r"\b(set_ylabel|ylabel)\s*[(=]"),
-}
-
 
 # Repeated-error detection. In testing, the model spent ten steps trying
 # variations of a fix for an error it had misdiagnosed, never stopping to
@@ -46,14 +35,42 @@ def error_signature(result: dict) -> str | None:
     return lines[-1] if lines else None
 
 
-def missing_chart_parts(code: str) -> list[str]:
-    """Which of title / x label / y label the code never sets.
+# A fix helper prints "[3] orders: drop_rows: 2 rows removed" for every change
+# it logs. Those lines, before an error, are fixes that already happened.
+LOGGED = re.compile(r"^\[(\d+)\] ", re.MULTILINE)
 
-    A text check, not a guarantee: it reads the code, not the image. It can
-    be fooled (e.g. a title set inside a helper function), but it catches the
-    common case of a model simply forgetting, which is what we need.
-    """
-    return [part for part, pattern in CHART_PARTS.items() if not pattern.search(code)]
+# A final reply saying the files are saved. In the eval (Nov 14), after the
+# re-check step, gemma wrote "The data has been saved to output/clean/" in 5
+# of 18 runs without ever calling save_clean(). Narrow on purpose: "I'll save
+# them once you approve" doesn't match; "have been saved", "are available in
+# output/clean" do.
+SAVE_CLAIM = re.compile(r"\b(?:have|has) been saved\b|\b(?:were|was|are|is) (?:now )?saved\b|"
+                        r"\bI(?: have|'ve)? saved\b|\b(?:are|is) (?:now )?available in\b[^\n]*output/clean",
+                        re.IGNORECASE)
+UNSAVED_NOTE = ("[Check] Your reply says the files were saved, but save_clean() has not run since the "
+                "last change, so nothing was written. If the user asked to save, run save_clean() for "
+                "each changed table now, in one block. Otherwise, correct your reply.")
+
+
+def applied_note(result: dict) -> str:
+    """After an error part-way through a block: which fixes already ran.
+
+    In testing, gemma re-ran the WHOLE block after every error. The helpers
+    skip a fix that's already done ("nothing to change"), but not always
+    cleanly: re-running "set the 400 hours to missing" met the missing value
+    it had made itself, and the condition failed. Told what already ran, the
+    model can continue from the line that failed instead. Empty when nothing
+    was logged (then re-running everything is right)."""
+    if result.get("status") != "error" or result.get("kernel_restarted"):
+        return ""
+    numbers = LOGGED.findall(result.get("stdout") or "")
+    if not numbers:
+        return ""
+    done = f"[{numbers[0]}]" if len(numbers) == 1 else f"[{numbers[0]}] to [{numbers[-1]}]"
+    return (f"Note: before the error, {len(numbers)} fix{'' if len(numbers) == 1 else 'es'} "
+            f"ran and {'was' if len(numbers) == 1 else 'were'} logged ({done} above). They are "
+            "already applied: don't run them again. Your next block starts at the line that "
+            "failed, and keeps every approved line after it.")
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +128,11 @@ class Agent:
     # e.g. {"KeyError: 'employee_id'": 2}, and the error that made us stop.
     error_counts: dict[str, int] = field(default_factory=dict)
     stuck_on: str | None = None
+    cut_note: str = ""               # told to the model with the next result
+    kernel: int | None = None        # number of the kernel this conversation uses
+    ran_code: bool = False           # has any code run in this kernel for us yet?
+    unsaved: bool = False            # a logged change since the last save_clean()?
+    save_checked: bool = False       # the false-"saved" check already ran this turn
 
     def __post_init__(self) -> None:
         # Runs right after the dataclass __init__. The conversation always
@@ -129,6 +151,8 @@ class Agent:
         self.steps = 0
         self.error_counts = {}  # a new message is a fresh start
         self.stuck_on = None
+        self.cut_note = ""
+        self.save_checked = False
         yield from self._run()
 
     def resume(self, approved: bool, feedback: str = "") -> Iterator[Event]:
@@ -141,6 +165,8 @@ class Agent:
         code, self.pending_code = self.pending_code, None
         if code is None:
             raise RuntimeError("Nothing is waiting for approval.")
+        if not approved:
+            self.cut_note = ""   # it was about code that will never run
         if approved:
             yield from self._execute(code)
             yield from self._run()
@@ -155,12 +181,15 @@ class Agent:
 
     def new_analysis(self) -> None:
         """Fresh kernel and an empty conversation."""
-        self.executor.reset()
+        self.kernel = self.executor.reset()
+        self.ran_code = False
+        self.unsaved = False
         self.history = [{"role": "system", "content": self.system_prompt}]
         self.pending_code = None
         self.steps = 0
         self.error_counts = {}
         self.stuck_on = None
+        self.cut_note = ""
 
     # --- Internals ---
 
@@ -182,39 +211,81 @@ class Agent:
                 return
 
             reply = self.llm.chat(self.history)
+            blocks = codeblocks.extract_code(reply)
+            # Keep the reply only up to the end of its first code block: the
+            # rest (more blocks, invented results, a premature summary) was
+            # written before any code ran. Neither the history nor the user
+            # sees it, and the model is told why with the real result.
+            reply, cut = codeblocks.trim_after_first_block(reply)
+            if len(blocks) > 1:
+                self.cut_note = (f"Note: your reply had {len(blocks)} python blocks. Only the first was "
+                                 "run, and everything after it was removed. Write exactly one block per "
+                                 "reply, then stop.")
+            elif cut:
+                self.cut_note = ("Note: the text you wrote after your code block was removed, because no "
+                                 "code had run yet. Never write results or conclusions yourself; stop "
+                                 "after the block and wait for the [Execution result].")
             self.history.append(codeblocks.assistant_message(reply))
             yield ModelReply(reply)
 
-            blocks = codeblocks.extract_code(reply)
             if not blocks:
+                # Claims the files are saved, but changes since the last save
+                # were never written: tell the model, once per turn.
+                if self.unsaved and not self.save_checked and SAVE_CLAIM.search(reply):
+                    self.save_checked = True
+                    self.history.append({"role": "user", "content": UNSAVED_NOTE})
+                    yield Notice("The model said the files were saved, but save_clean() hadn't run "
+                                 "since the last change; it was asked to save them or correct its reply.")
+                    continue
                 yield TurnDone("answered")  # an answer or a question: user's turn
                 return
             if len(blocks) > 1:
-                yield Notice(f"The model wrote {len(blocks)} code blocks; only the first runs.")
+                yield Notice(f"The model wrote {len(blocks)} code blocks; only the first runs, "
+                             "and the rest of its reply was removed.")
 
             code = blocks[0]
             if self.require_approval:
                 self.pending_code = code
                 yield NeedsApproval(code)
                 return  # paused; the caller continues with resume()
-            yield from self._execute(code, extra_blocks=len(blocks) - 1)
+            yield from self._execute(code)
 
-    def _execute(self, code: str, extra_blocks: int = 0) -> Iterator[Event]:
+    def _execute(self, code: str) -> Iterator[Event]:
         self.steps += 1
-        result = self.executor.execute(code)
+        # Someone else reset the shared kernel since our last step (in testing:
+        # running the tests while the UI was open). Running the code now would
+        # fail on tables that no longer exist, so don't: tell the model why.
+        # If none of our code has run yet, there were no tables to lose: take
+        # the new kernel as ours without a warning (and without making the
+        # user approve the same code twice).
+        other_reset = False
+        if self.kernel is not None:
+            now = self.executor.kernel()
+            if now is not None and now != self.kernel:
+                if self.ran_code:
+                    other_reset = True
+                else:
+                    self.kernel = now
+        if other_reset:
+            result = {"status": "error", "stdout": "", "stderr": "", "truncated": False,
+                      "kernel_restarted": True, "kernel": now,
+                      "error": "Your code was NOT run: another program reset the sandbox's kernel "
+                               "since your last step. Every table, variable and the change log are "
+                               "gone. Load the files again with load(), then redo the fixes the user "
+                               "approved."}
+        else:
+            result = self.executor.execute(code)
+            self.ran_code = self.ran_code or not result.get("executor_failure")
+        if result.get("kernel"):
+            self.kernel = result["kernel"]   # adopt the new kernel, ours from here on
+        self._track_saves(result.get("stdout") or "")
         text = format_for_model(result, self.max_result_chars)
-        if extra_blocks:
-            text += ("\n\nNote: your reply had more than one python block. Only the first "
-                     "was run. Write exactly one block per reply.")
-
-        # A chart came back: did the code give it a title and axis labels?
-        # If not, say exactly what's missing, so the model's next step is a
-        # redraw. Telling it right away works better than a rule it may skip.
-        missing = missing_chart_parts(code) if result.get("charts") else []
-        if missing:
-            text += (f"\n\nNote: the chart is missing {' and '.join(missing)}. Redraw it "
-                     "with ax.set_title(...) stating the finding, and ax.set_xlabel(...) / "
-                     "ax.set_ylabel(...) with units.")
+        note = applied_note(result)
+        if note:
+            text += "\n\n" + note
+        if self.cut_note:
+            text += "\n\n" + self.cut_note
+            self.cut_note = ""
 
         # The same error again? Count it; on the NUDGE_AT-th time, tell the
         # model to stop changing things and find the cause first.
@@ -234,12 +305,24 @@ class Agent:
 
         self.history.append(codeblocks.result_message(text))
         yield CodeResult(code, result, text)
-        if missing:
-            yield Notice(f"Chart is missing {', '.join(missing)}; asked the model to redraw it.")
         if repeats == NUDGE_AT:
             yield Notice(f"Same error {repeats} times ({signature}); asked the model to diagnose it.")
         if result.get("executor_failure"):
             yield Notice(f"Sandbox problem: {result['error']}")
+        if other_reset:
+            yield Notice("Another program (the tests, the CLI or the eval) reset the sandbox, so every "
+                         "table was lost. The code was not run; the model was told to load the files again.")
+
+    def _track_saves(self, stdout: str) -> None:
+        """Is there a logged change that no save_clean() has written yet?
+        A [n] line is a change; a save_clean: line writes everything logged
+        before it. So whichever comes LAST in the printout decides."""
+        last_change = max((m.start() for m in LOGGED.finditer(stdout)), default=-1)
+        last_save = stdout.rfind("save_clean:")
+        if last_change > last_save:
+            self.unsaved = True
+        elif last_save > last_change:
+            self.unsaved = False
 
     def _wrap_up(self) -> Iterator[Event]:
         """Step limit reached: ask for a summary instead of more code."""

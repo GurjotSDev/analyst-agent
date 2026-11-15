@@ -1,11 +1,15 @@
 """
-Terminal interface for the agent (stage 4). The Gradio UI replaces this in stage 6.
+Terminal interface for the cleanup bot. The web UI (ui.py) does the same
+with uploads and downloads; this stays for quick runs and debugging.
 
-Run from the agent/ folder:
-    uv run analyst
+Run from the agent/ folder (on Windows, Smart App Control may block the
+analyst.exe launcher; this form always works):
+    uv run python -m agent.cli
+
+It uses the CSV files at the top of data/ (the UI uses uploads instead).
 
 Commands while chatting:
-    /new        start a new analysis (fresh kernel, empty conversation)
+    /new        start a new session (fresh kernel, empty conversation)
     /auto       toggle approval mode (ask before running each code block)
     /quit       exit
 """
@@ -44,8 +48,6 @@ def show_result(event: CodeResult, show_code_first: bool) -> None:
     if r.get("error"):
         # The last lines of a traceback carry the actual error.
         print(textwrap.indent("\n".join(r["error"].strip().splitlines()[-6:]), "  "))
-    for chart in r.get("charts", []):
-        print(f"  chart saved: {config.OUTPUT_DIR / 'charts' / (chart['id'] + '.png')}")
     if r.get("kernel_restarted"):
         print("  (the kernel was restarted; all variables were lost)")
 
@@ -102,8 +104,13 @@ def main() -> None:
         max_steps=config.MAX_STEPS,
         max_result_chars=config.MAX_RESULT_CHARS,
     )
+    # The sandbox keeps running between sessions, so its kernel may still
+    # hold tables and a change log from earlier (an eval, or the last
+    # session). This conversation starts empty, so the kernel must too:
+    # otherwise check() also checks tables nobody asked about.
+    agent.new_analysis()
 
-    print(f"Analyst ready. Model: {config.MODEL}. Files: {', '.join(files) or 'none'}")
+    print(f"Cleanup bot ready. Model: {config.MODEL}. Files: {', '.join(files) or 'none'}")
     print("Approval mode is ON. Commands: /new  /auto  /quit\n")
 
     while True:
@@ -118,7 +125,7 @@ def main() -> None:
             break
         if text == "/new":
             agent.new_analysis()
-            print("(Started a new analysis.)")
+            print("(Started a new session.)")
             continue
         if text == "/auto":
             agent.require_approval = not agent.require_approval
