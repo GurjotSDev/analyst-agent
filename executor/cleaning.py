@@ -55,8 +55,8 @@ class CleaningError(Exception):
     """A fix was refused. The message says why and what to do instead."""
 
 
-# The records, one set per kernel. A kernel reset (/new) clears them, along
-# with every DataFrame, so they always describe the data that exists.
+# The records, one set per kernel. A kernel reset clears them along with
+# every DataFrame, so they always describe the data that exists.
 _SOURCES: dict[str, str] = {}               # table -> file it was loaded from
 _ORIGINALS: dict[str, pd.DataFrame] = {}    # table -> as read from the file
 _HISTORY: dict[str, list[pd.DataFrame]] = {}  # table -> every logged version, oldest first
@@ -251,9 +251,8 @@ def _need_mask(df: pd.DataFrame, mask) -> pd.Series:
 
 
 def _warn_no_match(action: str, table: str, verb: str) -> None:
-    """A selection that matches no rows is usually a mistake, not a fact about
-    the data. In testing, a model removed an ID from the wrong table, got
-    "nothing to change", and told the user the ID didn't exist."""
+    """A selection that matches no rows is usually a mistake (often the wrong
+    table), not a fact about the data, so say so instead of passing silently."""
     print(f"{action}({table}): WARNING: no rows in {table} match this condition, so nothing was "
           f"{verb} or logged. If the user asked for this fix, check the condition, and check "
           f"whether these rows are in another table (compare_keys shows where each ID is).")
@@ -269,9 +268,8 @@ def load(path, table: str | None = None) -> pd.DataFrame:
     path = Path(path)
     table = table or path.stem
     if not path.exists():
-        # In testing, a model copied the example paths from its instructions
-        # ('/data/orders.csv'). List the real files, so it can correct itself.
-        files = sorted(str(p) for p in Path("/data").rglob("*.csv")) if Path("/data").exists() else []
+        # List the real files, so a wrong path can be corrected.
+        files =sorted(str(p) for p in Path("/data").rglob("*.csv")) if Path("/data").exists() else []
         raise CleaningError(f"No file {path}. Use exactly the paths listed under 'Files available' "
                             f"in your instructions. (Every CSV in /data: {', '.join(files) or 'none'}.)")
     # pandas guesses each column's type, and reads '00012345' as the number

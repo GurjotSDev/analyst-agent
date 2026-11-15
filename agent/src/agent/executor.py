@@ -1,5 +1,5 @@
 """
-Client for the sandboxed executor (the Docker container from stage 3).
+Client for the sandboxed executor (the Docker container).
 
 The agent never runs model-written code itself. It hands the code to this
 client, which sends it to the executor over HTTP, and refuses to talk to any
@@ -8,7 +8,7 @@ executor that doesn't report it's running in the sandbox.
 
 import re
 
-import httpx  # HTTP client. The ollama library uses it too, so it's already installed.
+import httpx
 
 
 class ExecutorNotSafe(Exception):
@@ -17,19 +17,16 @@ class ExecutorNotSafe(Exception):
 
 class ExecutorClient:
     def __init__(self, base_url: str, timeout: float, transport: httpx.BaseTransport | None = None):
-        # A Client reuses one connection for many requests (faster than
-        # httpx.post() each time). base_url means calls can say "/execute"
-        # instead of the full address. `transport` lets tests swap in a fake
-        # server; normally it's None and real HTTP is used.
+        # `transport` lets tests swap in a fake server; normally it's None.
         self.http = httpx.Client(base_url=base_url, transport=transport, timeout=30)
         self.exec_timeout = timeout
 
     def check_sandboxed(self) -> None:
         """Raise ExecutorNotSafe unless the executor is up AND sandboxed.
 
-        Called before any model code runs. It protects against a mistake like
-        running the stage 2 server directly on Windows, where model code would
-        have full access to your files.
+        Called before any model code runs, so code is never sent to a server
+        started by hand outside the container, where it would have full access
+        to the host.
         """
         try:
             health = self.http.get("/health").json()
@@ -48,9 +45,7 @@ class ExecutorClient:
         """Run code; return the executor's JSON response as a dict.
 
         Never raises for problems on the executor's side: they come back as
-        an error result, so the agent keeps going and the model is told.
-        Before this, one server bug (a folder deleted while it ran) crashed the
-        whole session and lost everything in the kernel.
+        an error result, so the session survives and the model is told.
         """
         try:
             r = self.http.post("/execute", json={"code": code, "timeout": self.exec_timeout},
@@ -70,8 +65,8 @@ class ExecutorClient:
                     "error": "The kernel had stopped, so it was restarted before running "
                              "this code. All variables are gone; load the data again."}
         if r.status_code >= 500:
-            # A bug in the executor itself (HTTP 500 = "internal server error").
-            # The code may well have run; the failure was in handling its output.
+            # A bug in the executor itself. The code may well have run; the
+            # failure was in handling its output.
             return _executor_failure(
                 f"The sandbox had an internal error (HTTP {r.status_code}) while handling this "
                 "code's output. This is not a problem with your code. The code probably ran, "
@@ -87,9 +82,9 @@ class ExecutorClient:
 
     def kernel(self) -> int | None:
         """The number of the kernel running now, or None if the sandbox can't
-        be reached. It goes up by one with every reset or restart. Every
-        program shares this one kernel, so a number that changed since your
-        own reset means someone else reset it."""
+        be reached. It goes up with every reset or restart; all clients share
+        one kernel, so a change since your own reset means another client
+        reset it."""
         try:
             return self.http.get("/health").json().get("kernel")
         except (httpx.HTTPError, ValueError):
@@ -133,13 +128,11 @@ def shorten_report(text: str, limit: int) -> str:
     """Like shorten(), but for a helper's report: when it's too long, cut
     DETAIL lines and keep every key line.
 
-    Why: check() on two wide tables printed 6,672 characters, and shorten()
-    cut the middle, which held most of the first table's "Issues to report".
-    The model then never saw those issues, so it couldn't report them. The
-    numbered list is the one part it must see whole; the detail above it is
-    context. Detail lines are kept in order until the budget runs out, and
-    each run of cut lines is marked. If the key lines alone don't fit (or
-    there are none), it falls back to shorten()."""
+    A plain middle cut can remove part of an "Issues to report" list, and
+    the model can't report issues it never saw; the detail above the list is
+    only context. Detail lines are kept in order until the budget runs out,
+    and each run of cut lines is marked. If the key lines alone don't fit
+    (or there are none), it falls back to shorten()."""
     if len(text) <= limit:
         return text
     lines = text.splitlines()

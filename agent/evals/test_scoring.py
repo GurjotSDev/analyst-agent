@@ -1,9 +1,9 @@
 """
 Checks for the scorer, using no model and no sandbox.
 
-The important part is the bottom half: real replies from your own runs.
-A scorer is only useful if it agrees with a human reading the same reply,
-so the replies you judged correct must pass and the wrong ones must fail.
+The important part is the bottom half: real model replies. A scorer is only
+useful if it agrees with a human reading the same reply, so replies judged
+correct must pass and the wrong ones must fail.
 
 Run from agent/:
     uv run python evals/test_scoring.py
@@ -43,7 +43,7 @@ check("number on another line fails", not f.found_in("Salary\n$1,250,000"))
 check("keyword is case-insensitive", f.found_in("SALARY 1,250,000"))
 check("exact count must be exact", not Fact("dup", ["duplicate"], 3).found_in("4 duplicate rows"))
 
-# --- Real replies from your runs -------------------------------------------
+# --- Real model replies -------------------------------------------------------
 # Step 1 (explore): the model found all 8 problems. Must score 8/8.
 GOOD_EXPLORE = """
 | Missing salary values | 6 | None specified |
@@ -56,11 +56,11 @@ GOOD_EXPLORE = """
 - Employee ID **9999** appears in expenses (5 rows) but has no matching row in employees table
 """
 scores = score_facts(steps["explore"].facts, GOOD_EXPLORE)
-check("your good explore summary: 8/8 counts", all(v for k, v in scores.items()
+check("good explore summary: 8/8 counts", all(v for k, v in scores.items()
       if isinstance(next(f for f in steps["explore"].facts if f.name == k), Fact)))
-# It was written before outliers got a verdict: it never says which salary is
-# an error, so the newer check rightly fails it, and only that one.
-check("old summary: only the missing verdict fails", [k for k, v in scores.items() if not v]
+# It never says which salary is an error, so the verdict check rightly fails
+# it, and only that one.
+check("summary without a verdict: only that check fails", [k for k, v in scores.items() if not v]
       == ["1,250,000 called a likely error"], str([k for k, v in scores.items() if not v]))
 
 # The same summary with two numbers wrong must lose exactly those two.
@@ -76,7 +76,7 @@ check("Says: finds the phrase", asks.found_in("Are these dates Day-first or mont
 check("Says: absent phrase fails", not asks.found_in("I converted the dates."))
 
 # --- NeverProposes: a fix that must not be on the numbered list -------------
-# The proposal from the real UI session that started this check:
+# A real proposal that breaks two rules:
 bad = """I propose the following fixes:
 5. Drop the 5 salary outliers in employees (values 1,250,000, 306,600, and 289,000) [drop_rows]
 4. Fill 6 missing salary values in employees with 92400 (the median) [fill_missing]
@@ -129,7 +129,7 @@ check("no save check when a scenario saves nothing",
 
 
 
-# --- Real banking replies from the eval (gemma4:12b, 2026-11-07) ------------
+# --- Real banking replies --------------------------------------------------
 banking = BY_NAME["banking"].steps[0].facts
 RUN2 = """1. Merge 'savings' into 'Savings' (4 rows) (fix: `merge_variants`)
 2. Drop 3 exact duplicate rows in `transactions` (fix: `drop_duplicates`)
@@ -138,8 +138,7 @@ RUN2 = """1. Merge 'savings' into 'Savings' (4 rows) (fix: `merge_variants`)
 RUN3 = """3. For the 5 values in `amount` that are far beyond every other value (999,999.99), would you like to drop these rows or set the `amount` to missing?
 4. Are future dates allowed in the `opened_date` (account) and `timestamp` (transaction) columns?"""
 failed = lambda text: [k for k, v in score_facts(banking, text).items() if not v]
-# Run 2 DID report the 5 placeholders, in the report's new words ("far beyond"):
-# the check missed it only because it still looked for the old wording.
+# Run 2 did report the 5 placeholders, in the report's words ("far beyond").
 check("banking run 2: 'far beyond' counts as the sentinels", "5 sentinel amounts" not in failed(RUN2))
 check("banking run 2: no year 2031 is still a miss", "account opened in 2031" in failed(RUN2))
 # Run 3 really did skip them: no counts, no dates.

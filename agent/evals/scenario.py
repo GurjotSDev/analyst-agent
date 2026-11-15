@@ -11,7 +11,7 @@ Expectations are written against the original files (orig[...]) wherever
 possible, e.g. "every converted date equals the original text parsed day
 first", so they don't depend on random values in the fake data.
 
-Datasets: data/employees.csv + data/expenses.csv (the first fake data), and
+Datasets: data/employees.csv + data/expenses.csv (the sample data), and
 data/eval/* from make_datasets.py. All fake; the counts below are what was
 planted.
 """

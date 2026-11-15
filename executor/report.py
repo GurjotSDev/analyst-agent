@@ -8,16 +8,13 @@ rewrites them after every save, so they always match the files on disk.
     output/clean/cleaning_report.pdf   what was found, changed and left alone
     output/clean/data_dictionary.md    every column of every saved table
 
-fpdf2 builds the PDF: pure Python, so the Docker image needs no extra
-system software. Its built-in fonts (Helvetica) only cover Latin-1, the
-Western European characters, so other text (arrows, some symbols) is
-replaced before writing. A bundled Unicode font would avoid that, at the
-cost of shipping a font file.
+The PDF uses fpdf2's built-in fonts, which only cover Latin-1, so other
+characters (arrows, some symbols) are replaced before writing.
 """
 
+import re
 from datetime import datetime
 from pathlib import Path
-import re
 
 import pandas as pd
 from fpdf import FPDF
@@ -88,10 +85,8 @@ class _Report(FPDF):
 
 
 def _for_people(issue: str) -> str:
-    """An issue line as a person should read it. The checklist is written for
-    the model: '(fix: merge_variants)', '(suggest: ...)', '; say if this
-    column can hold future dates' tell IT what to do next. In the report,
-    after the cleaning is done, they are noise, so they're cut off.
+    """An issue line without the hints meant for the model ('(fix: ...)',
+    '(suggest: ...)', '; say if ...', '; ask ...'):
     'salary: 7 missing values (suggest: leave missing...)' -> 'salary: 7 missing values'."""
     issue = re.sub(r"\s*\((fix|suggest): .*\)$", "", issue)
     return re.sub(r"; (say if|ask) .*$", "", issue)
@@ -210,8 +205,8 @@ def _changes_rows(e: dict) -> bool:
     """Does a column-less entry belong under "Changes to whole rows"? Yes if it
     removed or added rows, or changed no cells (e.g. it added a column), so
     no column row would show it. A custom_fix that only edited cells is
-    listed under those columns instead. Logs written before cells_by_column
-    existed have no per-column counts, so they stay here, as they always were."""
+    listed under those columns instead. Entries without per-column counts
+    also stay here."""
     return bool(e.get("rows_removed") or e.get("rows_added") or not e.get("cells_by_column"))
 
 

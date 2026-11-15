@@ -15,14 +15,14 @@ class ModelNotAvailable(Exception):
 
 class OllamaLLM:
     def __init__(self, model: str, host: str, think: bool, num_ctx: int):
-        # Sensitive-data rules from the plan, enforced in code:
-        # 1. Cloud models run on Ollama's servers, so your data would leave this PC.
+        # Data never leaves this machine:
+        # 1. Cloud models run on Ollama's servers.
         if "cloud" in model:
             raise ModelNotAvailable(f"{model} is a cloud model; only local models are allowed.")
-        # 2. Only talk to an Ollama running on this PC. host.docker.internal is
-        #    Docker's name for the PC itself, used when the UI runs in a container.
+        # 2. Only a local Ollama. host.docker.internal is the host itself, as
+        #    seen from the UI container.
         if urlparse(host).hostname not in ("127.0.0.1", "localhost", "::1", "host.docker.internal"):
-            raise ModelNotAvailable(f"Ollama host {host} is not on this PC.")
+            raise ModelNotAvailable(f"Ollama host {host} is not on this machine.")
 
         self.model = model
         self.think = think
@@ -48,14 +48,11 @@ class OllamaLLM:
             think=self.think,
             options=self.options,
         )
-        # How big the request was. prompt_eval_count is the WHOLE input in
-        # tokens (system prompt + full history), cached parts included, so it
-        # shows how full the num_ctx window is. eval_count is the reply's
-        # length, thinking included. Ollama cuts the oldest input silently
-        # when it doesn't fit, so a count near num_ctx is a warning sign.
+        # prompt_eval_count is the whole input in tokens, so it shows how full
+        # the num_ctx window is; Ollama silently drops the oldest input when it
+        # doesn't fit. eval_count is the reply, thinking included.
         self.last_usage = {"prompt_tokens": response.prompt_eval_count or 0,
                            "reply_tokens": response.eval_count or 0}
-        # With think on, the reasoning arrives separately in message.thinking.
-        # We keep only the final answer: the reasoning would fill the context
-        # window fast and the model doesn't need its old reasoning back.
+        # Keep only the answer, not message.thinking: old reasoning would fill
+        # the context window and the model doesn't need it back.
         return response.message.content or ""

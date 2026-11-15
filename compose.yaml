@@ -1,44 +1,35 @@
-# Runs the cleanup bot: the sandbox, and the web UI. From the repo root:
-#   docker compose up -d --build    build (if needed) and start in the background
-#   docker compose logs -f          watch the server's output
+# The cleanup bot: the code sandbox and the web UI. From the repo root:
+#   docker compose up -d --build    build (if needed) and start
+#   docker compose logs -f          follow the logs
 #   docker compose down             stop and remove the containers
 #
-# Three containers:
-#   executor  runs model-written code. Lives ONLY on the "sandbox" network,
-#             which has no route to the internet or to your PC.
-#   proxy     a one-purpose port forwarder. It's the only way into the sandbox
-#             from your PC: it relays 127.0.0.1:8000 to executor:8000. The CLI
-#             and the eval use it.
-#   ui        the web app, at http://127.0.0.1:7860. It talks to the executor
-#             directly over the sandbox network, and to Ollama on your PC.
+#   executor  runs model-written code. Only on the "sandbox" network, which
+#             has no route to the internet or to the host.
+#   proxy     relays 127.0.0.1:8000 to executor:8000; the only way into the
+#             sandbox from the host (used by the CLI, the evals and the tests).
+#   ui        the web app at http://127.0.0.1:7860. Reaches the executor over
+#             the sandbox network and Ollama on the host.
 
 services:
   executor:
     build: ./executor
     networks: [sandbox]
     environment:
-      EXECUTOR_SANDBOXED: "1"     # reported by /health; the agent checks it
+      EXECUTOR_SANDBOXED: "1"     # reported by /health; the agent refuses an executor without it
     volumes:
-      # Your folders, shared into the container. ":ro" = read-only, so model
-      # code can never change or delete your original CSVs.
-      - ./data:/data:ro
+      - ./data:/data:ro           # read-only: model code can't change the original CSVs
       - ./output:/output
-    # --- Lockdown ---
-    read_only: true               # the container's own files can't be changed...
-    tmpfs:                        # ...except these scratch areas, kept in memory
-      - /tmp                      #    and wiped every time the container stops.
-      - /home/analyst:uid=1000,gid=1000,mode=700  # Jupyter keeps small files here;
-                                                  # owned by the analyst user
-    cap_drop: [ALL]               # remove every special Linux privilege
+    read_only: true
+    tmpfs:                        # in-memory scratch space, wiped when the container stops
+      - /tmp
+      - /home/analyst:uid=1000,gid=1000,mode=700  # Jupyter's runtime files
+    cap_drop: [ALL]
     security_opt:
-      - no-new-privileges:true    # and forbid regaining any (e.g. through sudo-like programs)
-    mem_limit: 4g                 # model code can't take more than 4 GB of RAM...
-    memswap_limit: 4g             # ...in total, counting swap. Without this Docker allows
-                                  # as much swap again (8 GB total) wherever swap exists,
-                                  # e.g. Docker Desktop on Windows (WSL2 has swap on by default).
-    cpus: 2                       # ...or more than 2 CPU cores
-    pids_limit: 256               # or start endless processes (a "fork bomb")
-    # Docker asks this every 10 s. "healthy" = the server answers /health.
+      - no-new-privileges:true
+    mem_limit: 4g
+    memswap_limit: 4g             # 4 GB in total; otherwise Docker allows as much again in swap
+    cpus: 2
+    pids_limit: 256               # no fork bombs
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
@@ -46,56 +37,46 @@ services:
       timeout: 6s
       start_period: 20s
       retries: 3
-    restart: unless-stopped       # if the server crashes, Docker starts it again
+    restart: unless-stopped
 
   proxy:
     image: alpine/socat:1.8.0.0
-    # socat = "SOcket CAT": copies bytes between two connections. This says:
-    # listen on port 8000; for every incoming connection (fork), open one to
-    # executor:8000 and relay both ways. It can't be told to go anywhere else.
+    # Listen on 8000 and relay every connection to executor:8000, nowhere else.
     command: ["TCP-LISTEN:8000,fork,reuseaddr", "TCP:executor:8000"]
     networks: [sandbox, outside]
     ports:
-      # host-ip:host-port:container-port. Binding to 127.0.0.1 means only
-      # programs on this PC can connect, not other devices on your Wi-Fi.
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8000:8000"     # this machine only, not the local network
     read_only: true
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
     depends_on:
       executor:
-        condition: service_healthy  # start only once the kernel is ready
+        condition: service_healthy
     restart: unless-stopped
 
   ui:
     build: ./agent
-    # sandbox: to reach executor:8000 directly. outside: to reach Ollama on
-    # your PC and to publish the port. That also lets this container reach the
-    # internet: accepted, because it runs only our own code (Gradio analytics
-    # off). The model's code still runs only in the executor, with no internet.
+    # "outside" is needed to reach Ollama and publish the port. This container
+    # runs only the app's own code; model code runs only in the executor.
     networks: [sandbox, outside]
     environment:
-      # Where things are, from inside this container (config.py reads these).
-      # Running the UI on Windows instead needs none of them: the defaults are
-      # the Windows locations.
+      # Paths as seen from inside the container (read by config.py). Running
+      # the UI directly on the host needs none of these.
       ANALYST_EXECUTOR_URL: http://executor:8000
-      ANALYST_OLLAMA_HOST: http://host.docker.internal:11434   # Docker's name for your PC
+      ANALYST_OLLAMA_HOST: http://host.docker.internal:11434
       ANALYST_DATA_DIR: /data
       ANALYST_OUTPUT_DIR: /output
-      ANALYST_UI_HOST: 0.0.0.0     # all interfaces INSIDE the container; see ports
-    # Docker Desktop (Windows, Mac) knows host.docker.internal by itself; this
-    # line makes the same name work on Linux too.
-    extra_hosts: ["host.docker.internal:host-gateway"]
+      ANALYST_UI_HOST: 0.0.0.0    # inside the container; see ports for who can connect
+    extra_hosts: ["host.docker.internal:host-gateway"]   # same host name on Linux
     volumes:
-      - ./data:/data               # writable HERE (uploads go to data/uploads/); still
-                                   # read-only for the executor, which runs the model's code
-      - ./output:/output:ro        # cleaned files and reports, for downloading
+      - ./data:/data              # writable here (uploads go to data/uploads/)
+      - ./output:/output:ro       # cleaned files and reports, for downloading
     ports:
-      - "127.0.0.1:7860:7860"      # only programs on this PC can open the UI
+      - "127.0.0.1:7860:7860"
     read_only: true
     tmpfs:
-      - /tmp                       # Gradio's upload cache: in memory, never on disk
+      - /tmp                      # Gradio's upload cache, in memory only
       - /home/app:uid=1000,gid=1000,mode=700
     cap_drop: [ALL]
     security_opt:
@@ -108,5 +89,5 @@ services:
 
 networks:
   sandbox:
-    internal: true    # no gateway: nothing on this network can reach the internet or your PC
-  outside: {}         # an ordinary network, needed only so the port above can be published
+    internal: true    # no gateway: no internet, no host
+  outside: {}         # an ordinary network, so ports can be published

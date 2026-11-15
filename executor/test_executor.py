@@ -5,7 +5,7 @@ Run from executor/:
     uv run python test_executor.py
 """
 
-import httpx  # HTTP client: sends requests to the server, like a browser would.
+import httpx
 
 BASE = "http://127.0.0.1:8000"
 
@@ -15,7 +15,7 @@ def execute(code: str, timeout: float = 60) -> dict:
     # the server can interrupt the code and reply before httpx gives up.
     r = httpx.post(f"{BASE}/execute", json={"code": code, "timeout": timeout},
                    timeout=timeout + 30)
-    r.raise_for_status()  # raises an exception for any 4xx/5xx response
+    r.raise_for_status()
     return r.json()
 
 

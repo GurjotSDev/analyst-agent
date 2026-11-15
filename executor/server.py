@@ -2,41 +2,37 @@
 Executor server: runs model-written Python in a persistent Jupyter kernel.
 
 The agent sends code over HTTP; this server runs it in the kernel and sends
-back what happened (printed text and errors). In stage 3 this whole file
-runs inside the Docker container, so the code it executes is sandboxed.
+back what happened (printed text and errors). It is meant to run inside the
+locked-down Docker container (compose.yaml), which is what sandboxes the code.
 
 Endpoints:
     GET  /health   is the kernel alive?
     POST /execute  run code, return its outputs
     POST /reset    restart the kernel with a clean slate
 
-Run locally for development (NOT for model code; it has no sandbox):
-    uv run uvicorn server:app --host 127.0.0.1 --port 8000
-Run sandboxed (stage 3), from the repo root:
+Run sandboxed, from the repo root:
     docker compose up -d --build
+Run locally for development only (no sandbox, never for model code):
+    uv run uvicorn server:app --host 127.0.0.1 --port 8000
 """
 
-import asyncio      # Python's built-in system for running async code. FastAPI is async,
-                    # and we use asyncio for timeouts and to allow one execution at a time.
-import os           # Reads environment variables, so settings can change without code edits.
-import queue        # Only for queue.Empty: the exception raised when no message arrives in time.
-import re           # Regular expressions; used to strip terminal color codes from tracebacks.
-from contextlib import asynccontextmanager  # Turns a function with `yield` into the
-                                            # setup/teardown pair FastAPI's lifespan expects.
-from pathlib import Path  # Object-oriented file paths that work on Windows and Linux alike.
+import asyncio
+import os
+import queue
+import re
+from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException  # The web framework, and its error response.
-from jupyter_client import AsyncKernelManager  # Starts, stops and restarts kernels.
-from pydantic import BaseModel  # Declares the shape of request/response JSON.
-                                # FastAPI uses it to validate input automatically.
+from fastapi import FastAPI, HTTPException
+from jupyter_client import AsyncKernelManager
+from pydantic import BaseModel
 
 
 # --------------------------------------------------------------------------
-# Settings (environment variables, with defaults for running locally)
+# Settings
 # --------------------------------------------------------------------------
 
-# In Docker these become /data and /output (stage 3). Locally they default to
-# the project's own data/ and output/ folders, one level above executor/.
+# /data and /output in Docker; the project's data/ and output/ folders locally.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", PROJECT_ROOT / "data"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", PROJECT_ROOT / "output"))
@@ -46,22 +42,14 @@ OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", PROJECT_ROOT / "output"))
 # report this, so a server accidentally started on Windows is never used.
 SANDBOXED = os.environ.get("EXECUTOR_SANDBOXED") == "1"
 
-DEFAULT_TIMEOUT = 60        # seconds per execution, from the plan
-MAX_OUTPUT_CHARS = 100_000  # safety cap on returned text. The agent trims further
-                            # (to ~5,000) before sending anything to the model.
+DEFAULT_TIMEOUT = 60        # seconds per execution
+MAX_OUTPUT_CHARS = 100_000  # safety cap; the agent trims further before the model sees it
 
-# The folder holding this file and analyst_helpers.py.
 HERE = Path(__file__).resolve().parent
 
-# Runs once in every fresh kernel, before any model code.
-#   - The kernel runs in output/, so Python wouldn't find analyst_helpers.py
-#     next to this file. sys.path is the list of folders Python searches when
-#     importing; adding ours makes `from analyst_helpers import ...` work.
-#     {str(HERE)!r} puts the path in as a quoted Python string.
-#   - pd and np are imported up front, under the names everyone uses, so the
-#     model's first block can't fail with "name 'pd' is not defined".
-#   - The finding helpers (analyst_helpers.py) and the fix helpers with their
-#     change log (cleaning.py) are imported by name, ready to call.
+# Runs once in every fresh kernel, before any model code. The kernel's working
+# directory is output/, so this folder is added to sys.path for the helper
+# imports. pd and np are preloaded under their usual names.
 KERNEL_SETUP = f"""
 import sys
 sys.path.insert(0, {str(HERE)!r})
@@ -73,8 +61,7 @@ from cleaning import (load, current, undo, drop_duplicates, drop_rows, set_missi
                       to_numbers, to_dates, custom_fix, show_log, save_clean, CleaningError)
 """
 
-# Terminal color codes look like "\x1b[0;31m". Tracebacks from the kernel
-# contain them (for colored output in a terminal); they're noise in our results.
+# Terminal color codes ("\x1b[0;31m") that kernel tracebacks contain.
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -113,30 +100,24 @@ class Kernel:
     def __init__(self) -> None:
         self.manager: AsyncKernelManager | None = None
         self.client = None
-        # Counts kernel starts: 1 for the first, +1 for every reset, crash or
-        # stuck-code restart. Every program using this sandbox (the UI, the
-        # CLI, the eval, the tests) shares ONE kernel, so a client compares
-        # this number with the one it got from its own reset: if it changed,
-        # someone else reset the kernel and its tables are gone.
+        # Counts kernel starts (first start, resets, crash and timeout restarts).
+        # All clients share one kernel, so a client that sees this change
+        # knows another client reset it and its tables are gone.
         self.generation = 0
-        # A lock lets only one execution run at a time. Two requests sharing a
-        # kernel at once would mix up their outputs.
+        # One execution at a time: concurrent requests would mix their outputs.
         self.lock = asyncio.Lock()
 
     async def start(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        # "python3" is the kernel ipykernel registers, using this same Python.
-        # The server and kernel talk over ports on 127.0.0.1 (this machine
-        # only), and every message is signed with a random key. The startup
-        # warning about "TCP without encryption" is about other programs on the
-        # same machine; inside the container (stage 3) there are none.
+        # The kernel talks to this server over 127.0.0.1 with signed messages.
+        # The "TCP without encryption" startup warning concerns other programs
+        # on the same machine; inside the container there are none.
         self.manager = AsyncKernelManager(kernel_name="python3")
-        # cwd = the kernel's working directory, so relative paths like
-        # "summary.csv" are saved into output/.
+        # Relative paths in model code (e.g. "summary.csv") land in output/.
         await self.manager.start_kernel(cwd=str(OUTPUT_DIR))
         self.client = self.manager.client()
-        self.client.start_channels()  # opens the connections to the kernel
+        self.client.start_channels()
         await self.client.wait_for_ready(timeout=60)
         await self._execute(KERNEL_SETUP, timeout=30)
         self.generation += 1
@@ -169,13 +150,10 @@ class Kernel:
     async def _execute(self, code: str, timeout: float) -> ExecuteResponse:
         """Send code to the kernel and collect everything it produces.
 
-        Callers must already hold the lock (or, like start(), run before any
-        request can arrive). asyncio.Lock can't be acquired twice by the same
-        code path, so start() calls this directly instead of run().
+        Callers must already hold the lock, or (like start()) run before any
+        request can arrive; asyncio.Lock isn't re-entrant.
         """
-        # execute() sends the code and returns a message ID. Every output
-        # message the kernel sends back for this code carries that ID as
-        # its "parent", which is how we know which outputs belong to it.
+        # Every output message for this code carries msg_id as its parent.
         msg_id = self.client.execute(code)
         try:
             return await asyncio.wait_for(self._collect(msg_id), timeout)
@@ -191,19 +169,17 @@ class Kernel:
                       "are gone and files must be loaded again. Use less memory, e.g. load "
                       "only the needed columns (usecols=...) or process data in chunks.")
 
-        # Too slow: ask the kernel to stop the code (Jupyter's stop button).
+        # Too slow: interrupt the code, like Jupyter's stop button.
         await self.manager.interrupt_kernel()
         if await self._drain(msg_id):
-            # It stopped and reported idle, so the kernel is usable and every
-            # variable created before this run still exists.
+            # Stopped cleanly: the kernel and its variables are still usable.
             return ExecuteResponse(
                 status="timeout",
                 error=f"Execution stopped after {timeout:.0f} seconds. "
                       "Variables from earlier steps are still available.")
 
-        # It did not stop. How a kernel is interrupted differs by operating
-        # system, and some code (C extensions, certain sleeps) ignores it.
-        # A kernel in that state can't be trusted, so replace it.
+        # Some code (C extensions, certain sleeps) ignores interrupts. A kernel
+        # in that state can't be trusted, so replace it.
         await self._restart()
         return ExecuteResponse(
             status="timeout",
@@ -218,11 +194,9 @@ class Kernel:
         error = None
 
         while True:
-            # The "iopub" channel is where the kernel broadcasts all outputs.
-            # Wait at most 1 second per message, so that while code runs quietly
-            # we regularly check the kernel is still alive. Without this, a
-            # kernel killed for using too much memory would leave us waiting
-            # for messages that never come, until the full timeout.
+            # Outputs arrive on the iopub channel. Waiting 1 second at a time
+            # lets us notice a kernel killed for using too much memory, instead
+            # of waiting out the full timeout for messages that never come.
             try:
                 msg = await self.client.get_iopub_msg(timeout=1)
             except queue.Empty:
@@ -234,14 +208,10 @@ class Kernel:
             kind, content = msg["msg_type"], msg["content"]
 
             if kind == "stream":
-                # Anything printed. "name" says whether it went to stdout or stderr.
                 (stdout if content["name"] == "stdout" else stderr).append(content["text"])
 
             elif kind in ("execute_result", "display_data"):
-                # execute_result = the value of the last line (like df.head()).
-                # display_data = something shown explicitly with display().
-                # Both can carry several formats of the same thing (plain text,
-                # HTML...); the model reads text, so we keep the plain version.
+                # The last line's value, or display(): keep the plain-text form.
                 data = content["data"]
                 if "text/plain" in data:
                     stdout.append(data["text/plain"] + "\n")
@@ -282,10 +252,8 @@ kernel = Kernel()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Everything before `yield` runs when the server starts...
     await kernel.start()
     yield
-    # ...and everything after it runs when the server shuts down.
     await kernel.stop()
 
 
@@ -301,8 +269,7 @@ async def health():
 @app.post("/execute", response_model=ExecuteResponse)
 async def execute(request: ExecuteRequest):
     if not await kernel.is_alive():
-        # 503 = "service unavailable": the kernel crashed (e.g. out of memory).
-        # The agent should call /reset and tell the model its variables are gone.
+        # The kernel crashed (e.g. out of memory): the client should call /reset.
         raise HTTPException(status_code=503, detail="Kernel is not running. Call /reset.")
     return await kernel.run(request.code, request.timeout)
 

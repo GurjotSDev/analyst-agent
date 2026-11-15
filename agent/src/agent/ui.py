@@ -13,7 +13,7 @@ All the logic lives in Session, so it can be tested without a browser.
 
 Privacy: share=False (no public Gradio link), analytics off, the chat's
 "share to Hugging Face" button removed, the server listens only where
-config.UI_HOST says (this PC), and uploads are deleted on New session and
+config.UI_HOST says (this machine), and uploads are deleted on New session and
 on exit (and at startup, in case the app crashed).
 """
 
@@ -65,8 +65,7 @@ def build_app(session: Session) -> gr.Blocks:
                 new = gr.Button("New session")
                 gr.Markdown(f"Model: {config.MODEL}. New session deletes the uploaded files.")
 
-        # Full width below the chat: the change log has six columns, which
-        # didn't fit in the side column without scrolling sideways.
+        # Full width below the chat: the change log's six columns need the room.
         with gr.Tabs():
             with gr.Tab("Change log"):
                 log = gr.Dataframe(headers=LOG_HEADERS, interactive=False, wrap=True, value=[],

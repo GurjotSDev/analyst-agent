@@ -1,7 +1,7 @@
 [project]
 name = "agent"
 version = "0.1.0"
-description = "Local data analyst agent"
+description = "Local data-cleaning agent with a Gradio UI"
 readme = "README.md"
 authors = [
     { name = "GurjotSDev", email = "" }

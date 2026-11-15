@@ -15,9 +15,8 @@ from dataclasses import dataclass, field
 from . import codeblocks
 from .executor import ExecutorClient, format_for_model
 
-# Repeated-error detection. In testing, the model spent ten steps trying
-# variations of a fix for an error it had misdiagnosed, never stopping to
-# re-read it. Counting each distinct error within one turn catches that.
+# Repeated-error detection: a model can keep trying variations of a fix for an
+# error it misdiagnosed. Counting each distinct error within one turn catches that.
 NUDGE_AT = 3   # on the 3rd occurrence: tell the model to stop and diagnose
 STOP_AT = 5    # on the 5th: end the turn and hand back to the user
 
@@ -39,11 +38,9 @@ def error_signature(result: dict) -> str | None:
 # it logs. Those lines, before an error, are fixes that already happened.
 LOGGED = re.compile(r"^\[(\d+)\] ", re.MULTILINE)
 
-# A final reply saying the files are saved. In the eval (Nov 14), after the
-# re-check step, gemma wrote "The data has been saved to output/clean/" in 5
-# of 18 runs without ever calling save_clean(). Narrow on purpose: "I'll save
-# them once you approve" doesn't match; "have been saved", "are available in
-# output/clean" do.
+# A final reply saying the files are saved, used to catch a claim made without
+# save_clean() having run. Narrow on purpose: "I'll save them once you approve"
+# doesn't match; "have been saved" and "are available in output/clean" do.
 SAVE_CLAIM = re.compile(r"\b(?:have|has) been saved\b|\b(?:were|was|are|is) (?:now )?saved\b|"
                         r"\bI(?: have|'ve)? saved\b|\b(?:are|is) (?:now )?available in\b[^\n]*output/clean",
                         re.IGNORECASE)
@@ -55,12 +52,10 @@ UNSAVED_NOTE = ("[Check] Your reply says the files were saved, but save_clean() 
 def applied_note(result: dict) -> str:
     """After an error part-way through a block: which fixes already ran.
 
-    In testing, gemma re-ran the WHOLE block after every error. The helpers
-    skip a fix that's already done ("nothing to change"), but not always
-    cleanly: re-running "set the 400 hours to missing" met the missing value
-    it had made itself, and the condition failed. Told what already ran, the
-    model can continue from the line that failed instead. Empty when nothing
-    was logged (then re-running everything is right)."""
+    Re-running a whole block after an error repeats fixes that already ran,
+    and a repeated fix can fail on its own earlier result (e.g. a condition
+    meeting a value it set to missing). Told what already ran, the model can
+    continue from the failing line instead. Empty when nothing was logged."""
     if result.get("status") != "error" or result.get("kernel_restarted"):
         return ""
     numbers = LOGGED.findall(result.get("stdout") or "")
@@ -76,8 +71,6 @@ def applied_note(result: dict) -> str:
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
-# @dataclass writes __init__ (and a readable print form) for us from the
-# field list, so each event is a one-line definition.
 
 @dataclass
 class ModelReply:
@@ -135,8 +128,7 @@ class Agent:
     save_checked: bool = False       # the false-"saved" check already ran this turn
 
     def __post_init__(self) -> None:
-        # Runs right after the dataclass __init__. The conversation always
-        # starts with the system prompt.
+        # The conversation always starts with the system prompt.
         if not self.history:
             self.history = [{"role": "system", "content": self.system_prompt}]
 
@@ -252,12 +244,10 @@ class Agent:
 
     def _execute(self, code: str) -> Iterator[Event]:
         self.steps += 1
-        # Someone else reset the shared kernel since our last step (in testing:
-        # running the tests while the UI was open). Running the code now would
-        # fail on tables that no longer exist, so don't: tell the model why.
-        # If none of our code has run yet, there were no tables to lose: take
-        # the new kernel as ours without a warning (and without making the
-        # user approve the same code twice).
+        # Another client reset the shared kernel since our last step. The code
+        # would fail on tables that no longer exist, so don't run it: tell the
+        # model why. If none of our code has run yet, nothing was lost, so just
+        # adopt the new kernel.
         other_reset = False
         if self.kernel is not None:
             now = self.executor.kernel()

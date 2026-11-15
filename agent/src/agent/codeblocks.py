@@ -3,16 +3,15 @@ Code-block mode: how code travels between the model and the agent.
 
 The model writes code in ```python fenced blocks inside its normal reply, and
 execution results go back as a user message. This module is the ONLY place that
-knows that format. Supporting tool-calling mode later (see stage 1) would mean
-writing a sibling module with the same three functions.
+knows that format, so a tool-calling version would be a sibling module with
+the same functions.
 """
 
 import re
 
-# ```python (or ```py), optional spaces, newline, then the code, lazily (.*?)
-# up to the first closing ```. re.DOTALL lets "." match newlines too.
-# A block with no closing fence is ignored on purpose: it usually means the
-# reply was cut off, and running half a program is worse than running nothing.
+# A ```python (or ```py) block up to the first closing fence. A block with no
+# closing fence is ignored on purpose: the reply was probably cut off, and
+# running half a program is worse than running nothing.
 CODE_BLOCK = re.compile(r"```(?:python|py)[ \t]*\n(.*?)```", re.DOTALL)
 
 
@@ -25,10 +24,9 @@ def trim_after_first_block(reply: str) -> tuple[str, str]:
     """Split a reply at the end of its first code block: (kept, cut).
 
     Anything after the first block was written before any code ran, so it
-    can only be a guess. In testing, a model wrote three blocks, each followed
-    by an invented [Execution result] (wrong row counts, made-up IDs), and
-    later believed its own inventions. Cutting them keeps the history to real
-    results only. A reply without a code block is kept whole."""
+    can only be a guess (more code, or invented results). Cutting it keeps
+    the history to real results only. A reply without a code block is kept
+    whole."""
     match = CODE_BLOCK.search(reply)
     if not match:
         return reply, ""
@@ -42,5 +40,5 @@ def assistant_message(reply: str) -> dict:
 
 def result_message(text: str) -> dict:
     """An execution result, as stored in the history. In this mode it's a
-    user message, clearly labelled so the model can't mistake it for you."""
+    user message, labelled so it can't be mistaken for the user."""
     return {"role": "user", "content": f"[Execution result]\n{text}"}

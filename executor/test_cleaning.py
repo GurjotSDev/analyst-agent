@@ -64,7 +64,7 @@ def csv(name: str, df: pd.DataFrame) -> Path:
 
 
 # =============================================================================
-# 1. The fake data, cleaned exactly as the eval's message 2 asks
+# 1. The sample data, cleaned as the expenses eval scenario asks
 # =============================================================================
 fresh()
 emp, _ = quiet(load, DATA / "employees.csv")
@@ -167,7 +167,7 @@ check("reason required", "Give a reason" in refused(drop_rows, exp, exp["amount"
 check("unknown column refused", "No column 'amnt'" in refused(fill_missing, exp, "amnt", 0))
 
 # =============================================================================
-# 3. The new fix helpers, on the Stage A problems
+# 3. The other fix helpers, on one table with each problem
 # =============================================================================
 fresh()
 orders_csv = csv("orders", pd.DataFrame({

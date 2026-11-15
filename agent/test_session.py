@@ -143,7 +143,7 @@ check("new session: chat empty", s.messages == [] and s.pending_code is None)
 check("new session: kernel fresh", "NameError" in (executor.execute("print(x)")["error"] or ""))
 
 # =============================================================================
-# F3: uploads, the change log, downloads, and deleting uploads
+# Uploads, the change log, downloads, and deleting uploads
 # =============================================================================
 import tempfile
 from pathlib import Path

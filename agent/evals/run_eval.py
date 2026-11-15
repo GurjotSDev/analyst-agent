@@ -15,7 +15,7 @@ Each run is saved in full (transcript + scores) to output/evals/, so you can
 read exactly what happened in any run that failed.
 """
 
-import argparse   # reads command-line options like --runs 5
+import argparse
 import json
 import time
 from datetime import datetime

@@ -1,9 +1,9 @@
 """
-Stage 4 checks for the agent loop, WITHOUT a real model.
+Checks for the agent loop, without a real model.
 
 A ScriptedLLM plays back fixed replies, so each test is fast and gives the same
 result every time. Everything else is real: the loop, the code extraction, and
-the sandboxed executor running code on the fake data in data/.
+the sandboxed executor running code on the sample data in data/.
 
 Needs the executor running (from the repo root: docker compose up -d).
 Run from agent/:
@@ -183,8 +183,7 @@ check("user told about sandbox failure", any(isinstance(e, Notice) and "Sandbox 
 s = shorten("A" * 100 + "Z" * 100, 60)
 check("shorten keeps both ends", s.startswith("A") and s.endswith("Z"))
 
-# 13b. A long report loses detail lines, never checklist lines: in a test with
-#      two wide tables, plain shorten() cut most of the first "Issues to report".
+# 13b. A long report loses detail lines, never checklist lines.
 from agent.executor import shorten_report
 report = "\n".join(["load: a = a.csv, 26 rows", "=== a: 26 rows x 30 columns ==="]
                    + [f"col{i}: 'x' 5, 'y' 3, 'z' 1, plus a long list of example values {i}" for i in range(60)]
@@ -248,7 +247,7 @@ agent, llm = new_agent([py("print(1)"), "ok"], require_approval=False)   # its o
 events = list(agent.send("go"))
 check("own reset is not 'another program'", not any(isinstance(e, Notice) and "Another program" in e.text
                                                     for e in events))
-# 18. An error part-way through a block: the model is told which fixes already
+# 17. An error part-way through a block: the model is told which fixes already
 #     ran, so it continues from the failing line instead of repeating them.
 from agent.loop import applied_note
 failed = {"status": "error", "error": "CleaningError: not real dates",
@@ -264,7 +263,7 @@ agent, llm = new_agent([py("print('[1] t: drop_rows: 1 row removed')\nraise Valu
 list(agent.send("go"))
 check("applied note reaches the model", "don't run them again" in llm.seen[1][-1]["content"])
 
-# 19. A reply that says the files were saved, when save_clean() never ran
+# 18. A reply that says the files were saved, when save_clean() never ran
 #     since the last change: the model is told, once, and gets to save.
 fix = py("print('[1] t: drop_rows: 1 row removed')")
 agent, llm = new_agent([fix, "Done. The files have been saved to output/clean/.",
@@ -286,7 +285,7 @@ check("real save: no false alarm", not any(isinstance(e, Notice) for e in events
 agent, llm = new_agent([fix, "Once you approve, the files will be saved."], require_approval=False)
 check("a promise to save is not a claim", not any(isinstance(e, Notice) for e in agent.send("go")))
 
-# 17. An outside reset before ANY of our code ran: nothing was lost, so the
+# 19. An outside reset before ANY of our code ran: nothing was lost, so the
 #     code just runs in the new kernel, with no warning and no second approval.
 agent, llm = new_agent([py("print('first run')"), "ok"], require_approval=False)
 executor.reset()

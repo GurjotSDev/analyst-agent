@@ -1,13 +1,9 @@
 """
 Tested data-quality helpers, preloaded into every kernel.
 
-The model calls these instead of writing its own checking and cleaning code.
-In testing, the model found most problems when asked, but its improvised code
-had bugs: counting missing values as a category (hiding a misspelling), and
-"fixing" capitalisation with .str.capitalize(), which also broke correct
-values ('HR' -> 'Hr'). These functions are tested once against known data
-(test_helpers.py), so the routine work is right every time and the model only
-has to interpret and decide.
+The model calls these instead of writing its own checking code. They are
+tested against known data (test_helpers.py), so the routine work is right
+every time and the model only has to interpret the results and decide.
 
     profile(orders, "orders")              data-quality report for one table
     compare_keys(orders, customers, "customer_id", "orders", "customers")
@@ -24,8 +20,7 @@ import pandas as pd
 from pandas.api import types
 
 MAX_LISTED_VALUES = 15   # text columns with at most this many values get full counts
-MISSING = "NaN (missing)"  # how missing values are shown. Not "<missing>": the model
-                           # mistook that for a real text value and searched for it.
+MISSING = "NaN (missing)"  # how missing values are shown; "<missing>" reads like a text value
 
 # Text that people type to mean "no value". pandas already reads '', 'NA', 'N/A',
 # 'NULL', 'None' and 'nan' as missing, so these are the ones that get through
@@ -238,11 +233,9 @@ def _check_date_range(df: pd.DataFrame, col: str, dates: pd.Series,
                       out: list[str], issues: list[str], text: bool = False) -> None:
     """Dates in the future, or before 1900: shared by text and real date columns.
 
-    Each line hands the model a ready-made condition, as the outlier lines
-    do. Without one, gemma wrote its own for "set the future week to
-    missing": week_start > "2025-12-31", which matched EVERY week in a file
-    of 2026 timesheets. The condition is the same cut-off the check used, so
-    it selects exactly the dates counted here. text=True: the column is
+    Each line includes a ready-made condition using the same cut-off as the
+    check, so it selects exactly the dates counted here; a guessed cut-off
+    can easily select every date in the column. text=True: the column is
     still text, so the condition only works after to_dates."""
     valid = dates.dropna()
     if valid.empty:
@@ -356,9 +349,8 @@ def _outlier_issue(df: pd.DataFrame, col: str, v: pd.Series, extreme: pd.Series,
     which look like errors, so the model repeats a tested judgement instead
     of making (or dodging) its own.
 
-    The verdict comes FIRST ("salary: likely an error: ..."). In the eval,
-    gemma copied the start of each line and cut the end off, which is where
-    the verdict used to be. Anything a model must repeat goes up front.
+    The verdict comes first ("salary: likely an error: ..."), because models
+    tend to copy the start of a line and drop the end.
 
     text=True: the column is still text, so the condition only works once
     to_numbers has run; the suggestion says so."""
@@ -380,11 +372,9 @@ def _outlier_issue(df: pd.DataFrame, col: str, v: pd.Series, extreme: pd.Series,
     if (v[apart] < v.median()).any():
         parts.append(f"{col} < {_plain(rest.min())}")
     condition = " or ".join(parts)
-    # A column with missing values gives <NA> for them in "hours > 42" (after
-    # to_numbers it's a nullable Int64), and the fix helpers refuse a
-    # selection with <NA> in it. Hand over a condition that works first time:
-    # a missing value is never one of the errors. Text columns get it too:
-    # their placeholders and non-numbers become missing when converted.
+    # In a nullable column, "hours > 42" is <NA> for missing values, and the
+    # fix helpers refuse a selection containing <NA>. Text columns gain
+    # missing values when converted, so they get the same treatment.
     if text or df[col].isna().any():
         condition = f"({condition}).fillna(False)"
     verdict = "likely an error" if len(apart) == 1 else "likely errors"
@@ -395,6 +385,7 @@ def _outlier_issue(df: pd.DataFrame, col: str, v: pd.Series, extreme: pd.Series,
             f"value{others} (suggest: {after}fix only the likely {'error' if len(apart) == 1 else 'errors'}, "
             f"selecting {'it' if len(apart) == 1 else 'them'} with the condition {condition}; ask whether to drop the rows or "
             f"set the value to missing{'; keep the plausible ones' if n_rest else ''})")
+
 
 def _check_numbers(df: pd.DataFrame, col: str, v: pd.Series, out: list[str], issues: list[str],
                    text: bool = False) -> None:
@@ -420,9 +411,8 @@ def _check_numbers(df: pd.DataFrame, col: str, v: pd.Series, out: list[str], iss
         # Show the most extreme few, furthest from the median first.
         worst = (extreme - v.median()).abs().sort_values(ascending=False).index[:3]
         examples = ", ".join(f"{_fmt(v[i])} ({_row_label(df, i)})" for i in worst)
-        # Say when the list is incomplete: a model given "most extreme:
-        # A, B, C" for 4 values fixed those 3 by ID and missed the 4th.
-        shown = (f"most extreme {len(worst)} of {len(extreme):,}"
+        # Say when the list is incomplete, so it isn't taken as every value.
+        shown =(f"most extreme {len(worst)} of {len(extreme):,}"
                  if len(worst) < len(extreme) else "all of them")
         out.append(f"  far from typical (outside {_fmt(low)} to {_fmt(high)}): "
                    f"{len(extreme):,} values; {shown}: {examples}")
@@ -431,8 +421,7 @@ def _check_numbers(df: pd.DataFrame, col: str, v: pd.Series, out: list[str], iss
 
 def _issues_block(issues: list[str]) -> str:
     """The numbered checklist that ends every report. The model copies these
-    lines into its summary, which is easier than collecting them from the
-    report above (in testing it reliably dropped one or two)."""
+    lines into its reply rather than collecting them from the report above."""
     if not issues:
         return "Issues to report: none"
     lines = [f"Issues to report ({len(issues)}):"]
@@ -578,10 +567,8 @@ def _profile(df: pd.DataFrame, name: str) -> tuple[list[str], list[str]]:
                     line += f"; not numbers: {_plural(len(other), 'value')} (e.g. {_examples(other)})"
                 out.append(f"  ! {line}")
                 issues.append(line + " (fix: to_numbers)")
-                # Check the values as the numbers they will become. Otherwise a
-                # typo like '$75,000' among '$750' day rates stays hidden until
-                # after to_numbers, when the fixes are already approved and the
-                # model is about to save.
+                # Check the values as the numbers they will become, so an
+                # outlier like '$75,000' among '$750' shows up before converting.
                 as_numbers = numbers.dropna()
                 if len(as_numbers):
                     _check_numbers(df, col, as_numbers, out, issues, text=True)
@@ -596,10 +583,9 @@ def _profile(df: pd.DataFrame, name: str) -> tuple[list[str], list[str]]:
 
             for spellings in _variant_groups(s, spaces_only_too=False):
                 variants = " / ".join(f"{k!r} {n:,}" for k, n in spellings.items())
-                # The count a merge changes, ready to copy: given "'Cloud Ops' 6 /
-                # 'cloud ops' 1 / 'CLOUD OPS' 1", gemma proposed merging "3 rows"
-                # (it added the wrong numbers). merge_variants keeps the most
-                # common spelling, which _variant_groups lists first.
+                # How many values a merge changes, so the model doesn't have to
+                # add them up. merge_variants keeps the most common spelling,
+                # which _variant_groups lists first.
                 changed = int(spellings.iloc[1:].sum())
                 merge = f"merging changes {_plural(changed, 'value')} to {spellings.index[0]!r}"
                 out.append(f"  ! spelling variants in {col}: {variants}; {merge}")
@@ -649,8 +635,6 @@ def compare_keys(left: pd.DataFrame, right: pd.DataFrame, on: str,
                            f"(normal: not every {name} row has {other_name} rows)")
             else:
                 out.append(f"In {name} but not {other_name}: {line}")
-                # A ready-made condition, as for outliers: without one, the
-                # model reported these rows but proposed no fix at all.
                 issues.append(f"{name}: {line} not in {other_name}; these rows point at nothing "
                               f"(suggest: ask whether to drop these rows; to drop them, drop_rows with "
                               f"the condition ~{name}[{on!r}].isin({other_name}[{on!r}]))")
@@ -667,14 +651,9 @@ def check(*tables: pd.DataFrame) -> None:
 
         check(orders, customers)
 
-    Tables from load() carry their names, so none need passing. In testing, a
-    model planned profile() and compare_keys() as separate steps, ran only the
-    first, and never saw that one table had rows for an ID the other lacked.
-    One call means no step can be skipped.
-
-    check() with no tables checks every table loaded so far. In testing, a
-    model loaded three files and passed only two, so a table is never left
-    out silently: any loaded table not passed is named at the end."""
+    Tables from load() carry their names, so none need passing. One call means
+    no step can be skipped. check() with no tables checks every table loaded
+    so far; any loaded table left out of the call is named at the end."""
     import cleaning   # here, not at the top: cleaning.py imports this module
     loaded = {name: versions[-1] for name, versions in cleaning._HISTORY.items()}
     if not tables:

@@ -266,8 +266,8 @@ class Session:
                 self._set_working(_next_step(event, self.agent.require_approval))
                 yield
         except Exception as e:
-            # Same safety net as the CLI: a failure (Ollama stopped, sandbox
-            # down) is shown in the chat, and the session stays usable.
+            # A failure (Ollama stopped, sandbox down) is shown in the chat,
+            # and the session stays usable.
             self._set_working(None)
             self.pending_code = None
             self.agent.pending_code = None
@@ -392,5 +392,5 @@ def make_session() -> Session:
     agent = Agent(llm=llm, executor=executor, system_prompt=build_system_prompt([]),
                   max_steps=config.MAX_STEPS, max_result_chars=config.MAX_RESULT_CHARS)
     session = Session(agent, data_dir=config.DATA_DIR, output_dir=config.OUTPUT_DIR)
-    session.new()   # never inherit an earlier session's kernel (see cli.py)
+    session.new()   # never inherit an earlier session's kernel
     return session

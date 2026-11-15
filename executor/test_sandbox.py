@@ -1,5 +1,5 @@
 """
-Stage 3 checks: does the sandbox actually contain model-written code?
+Sandbox checks: does the container actually contain model-written code?
 
 Each check sends code to the executor that tries to do something it must NOT be
 able to do, exactly as model code would, and confirms it fails.

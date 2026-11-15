@@ -2,8 +2,7 @@
 Terminal interface for the cleanup bot. The web UI (ui.py) does the same
 with uploads and downloads; this stays for quick runs and debugging.
 
-Run from the agent/ folder (on Windows, Smart App Control may block the
-analyst.exe launcher; this form always works):
+Run from the agent/ folder:
     uv run python -m agent.cli
 
 It uses the CSV files at the top of data/ (the UI uses uploads instead).
@@ -68,10 +67,9 @@ def drive(agent: Agent, events) -> None:
     while events is not None:
         next_events = None
         for event in events:
-            match event:  # Python's pattern matching: pick a branch by event type
+            match event:
                 case ModelReply(text=text):
-                    # Code blocks are shown separately, numbered, so replace
-                    # them here with a placeholder instead of printing twice.
+                    # Code is shown separately, numbered.
                     prose = CODE_BLOCK.sub("[code below]", text).strip()
                     print(f"\n{RULE}\nModel:\n{prose}\n{RULE}")
                 case NeedsApproval(code=code):
@@ -104,10 +102,8 @@ def main() -> None:
         max_steps=config.MAX_STEPS,
         max_result_chars=config.MAX_RESULT_CHARS,
     )
-    # The sandbox keeps running between sessions, so its kernel may still
-    # hold tables and a change log from earlier (an eval, or the last
-    # session). This conversation starts empty, so the kernel must too:
-    # otherwise check() also checks tables nobody asked about.
+    # The shared kernel may still hold tables from an earlier session; start
+    # it empty, like the conversation, so check() sees only this session's tables.
     agent.new_analysis()
 
     print(f"Cleanup bot ready. Model: {config.MODEL}. Files: {', '.join(files) or 'none'}")
@@ -116,7 +112,7 @@ def main() -> None:
     while True:
         try:
             text = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):  # Ctrl+Z/Ctrl+D or Ctrl+C
+        except (EOFError, KeyboardInterrupt):
             print()
             break
         if not text:
@@ -134,9 +130,8 @@ def main() -> None:
         try:
             drive(agent, agent.send(text))
         except Exception as e:
-            # Anything unexpected (e.g. Ollama stopped mid-answer): report it
-            # and return to the prompt instead of ending the program. The
-            # kernel, and everything loaded in it, survives.
+            # E.g. Ollama stopped mid-answer: report it and keep the session;
+            # the kernel and everything loaded in it survive.
             print(f"\n(error) {type(e).__name__}: {e}")
             print("(Your session is still open. Fix the problem, then continue or /new.)")
             agent.pending_code = None  # never leave the agent stuck waiting for approval

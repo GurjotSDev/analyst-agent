@@ -5,8 +5,8 @@ Writes data/eval/<scenario>/*.csv. Everything is fake and comes from a fixed
 random seed, so every run of this script produces byte-identical files, and
 the answer keys in scenario.py stay right.
 
-Plain Python only (csv + random, no pandas): it runs on Windows without
-loading numpy, which Smart App Control blocks in the local venv.
+Plain Python only (csv + random, no pandas), so it runs on the host without
+the data libraries the sandbox has.
 
 Run from agent/:
     uv run python evals/make_datasets.py
@@ -193,8 +193,8 @@ def clean() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Staffing: contractors and their weekly timesheets. Built from what a live
-# test on Nov 14 found: each trap below once caught the bot out.
+# Staffing: contractors and their weekly timesheets, with traps for the
+# checks that are easiest to get wrong.
 # ---------------------------------------------------------------------------
 def staffing() -> None:
     rng = random.Random(505)

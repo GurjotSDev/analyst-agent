@@ -3,8 +3,7 @@ Checks for analyst_helpers.py: does profile() / compare_keys() report every
 problem planted in the fake data, with the right numbers? (The fixes are
 tested in test_cleaning.py.)
 
-Run inside the sandbox image (Windows' Smart App Control can block numpy in
-the local venv), from the repo root:
+Run inside the sandbox image, from the repo root:
     docker compose run --rm -v "${PWD}\executor\test_helpers.py:/app/test_helpers.py:ro" executor python test_helpers.py
 """
 
@@ -22,8 +21,7 @@ DATA = Path(__file__).resolve().parent.parent / "data"
 
 
 def captured(func, *args) -> str:
-    """Run a function that prints, and return what it printed as a string.
-    redirect_stdout temporarily sends print() into a StringIO buffer."""
+    """Run a function that prints, and return what it printed."""
     buffer = io.StringIO()
     with contextlib.redirect_stdout(buffer):
         func(*args)
@@ -103,7 +101,7 @@ check("missing keys in checklist", "L: 1 row with no k" in out)
 check("rows vs IDs counted separately", "In R but not L: 1 ID in 2 rows (IDs: 3)" in out)
 
 # =============================================================================
-# Stage A: the new checks, on a small table with one of each problem planted
+# Each check on a small table with one of each problem planted
 # =============================================================================
 orders = pd.DataFrame({
     "order_id": range(1, 11),
@@ -157,8 +155,7 @@ real_dates = pd.DataFrame({"when": pd.to_datetime(["2025-01-01", "2099-01-01"])}
 check("A: real date columns checked too", "1 date in the future" in captured(profile, real_dates, "t"))
 
 # Future and pre-1900 dates come with a ready-made condition: the cut-off the
-# check itself used, so it selects exactly the dates it counted (a model-made
-# condition once matched every date in the file).
+# check itself used, so it selects exactly the dates it counted.
 today = pd.Timestamp.today().normalize().strftime("%Y-%m-%d")
 check("A: future date: condition is today", f"with the condition ship_date > '{today}'" in issues, issues)
 check("A: future date: text column converted first", "(suggest: if not, after to_dates, select it" in issues)
@@ -169,7 +166,7 @@ check("A: before 1900: condition given", "with the condition ship_date < '1900-0
 shipped = pd.to_datetime(orders["ship_date"])
 check("A: future condition selects only the future date", (shipped > today).sum() == 1)
 
-# Things the new checks must NOT flag
+# Things these checks must NOT flag
 fine = pd.DataFrame({
     "zip": ["02134", "10001", "94105"],                   # codes: leading zeros
     "name": ["Ana Silva", "Bo Chen", "Cy Diaz"],          # ordinary text
@@ -192,7 +189,7 @@ check("check(): compares only shared ID columns", both.count("=== employees vs e
 unrelated = captured(check_tables, pd.DataFrame({"a_id": [1]}), pd.DataFrame({"b_id": [1]}))
 check("check(): unrelated tables not compared", "no shared ID column" in unrelated)
 
-# Stage D findings: which direction of a key mismatch is an issue
+# Which direction of a key mismatch is an issue
 customers = pd.DataFrame({"customer_id": [1, 2, 3]})
 orders = pd.DataFrame({"customer_id": [1, 1, 2, 9, 9]})
 out = captured(compare_keys, customers, orders, "customer_id", "customers", "orders")
@@ -214,11 +211,11 @@ check("mixed units not treated as one unit", "numbers stored with a unit" not in
 check("plain words not a unit", "numbers stored with a unit" not in
       captured(profile, pd.DataFrame({"c": ["red", "blue", "red", "green"]}), "t"))
 
-# Grammar
+# Singular and plural wording
 one = captured(profile, pd.DataFrame({"x": ["a", "b", "-"]}), "t")
 check("one placeholder: 'means'", "1 placeholder value that probably means missing" in one)
 
-# Stage D, round 2: incomplete example lists are labelled as incomplete
+# Incomplete example lists are labelled as incomplete
 check("example list says it is partial", "5 values; most extreme 3 of 5:" in p_emp)
 check("fix hint: select with a condition", "with the condition (salary > 306600).fillna(False)" in checklist(p_emp))
 # salary has missing values: the plain condition gives <NA> for them (nullable

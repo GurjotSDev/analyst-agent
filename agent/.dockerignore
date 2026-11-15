@@ -1,5 +1,4 @@
-# Files Docker never sends into the build. Keeps the image small, the build
-# fast, and stops a local .venv (built for Windows) from leaking into a Linux image.
+# Kept out of the build: a local .venv is built for Windows, not Linux.
 .venv/
 __pycache__/
 *.pyc
