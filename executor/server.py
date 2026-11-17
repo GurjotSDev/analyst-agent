@@ -9,6 +9,8 @@ Endpoints:
     GET  /health   is the kernel alive?
     POST /execute  run code, return its outputs
     POST /reset    restart the kernel with a clean slate
+    POST /sql      run one read-only SQL query on the files listed (sql.py)
+    POST /sql/schema  the listed files' tables: columns, types, row counts
 
 Run sandboxed, from the repo root:
     docker compose up -d --build
@@ -26,6 +28,8 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from jupyter_client import AsyncKernelManager
 from pydantic import BaseModel
+
+from sql import SqlEngine
 
 
 # --------------------------------------------------------------------------
@@ -72,6 +76,18 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 class ExecuteRequest(BaseModel):
     code: str
     timeout: float = DEFAULT_TIMEOUT
+
+
+class SqlRequest(BaseModel):
+    query: str
+    # Sandbox paths of the CSVs to query: this session's cleaned tables
+    # (/output/clean/x.csv) and Ask-tab uploads (/data/uploads/<id>/ask/x.csv).
+    # Empty: no tables (SELECT 1 still runs).
+    files: list[str] = []
+
+
+class SchemaRequest(BaseModel):
+    files: list[str] = []
 
 
 class ExecuteResponse(BaseModel):
@@ -278,3 +294,23 @@ async def execute(request: ExecuteRequest):
 async def reset():
     await kernel.restart()
     return {"status": "ok", "kernel": kernel.generation}
+
+# --------------------------------------------------------------------------
+# Read-only SQL (the question-answering agent). Separate from the kernel:
+# a query never touches the cleaner's tables, and /reset doesn't affect it.
+# --------------------------------------------------------------------------
+
+sql_engine = SqlEngine(OUTPUT_DIR, DATA_DIR)
+
+
+@app.post("/sql")
+async def sql(request: SqlRequest):
+    # DuckDB blocks while it works; a worker thread keeps the server free to
+    # answer /health and /execute meanwhile.
+    return await asyncio.to_thread(sql_engine.run, request.query, request.files)
+
+
+# POST, not GET: the file list rides in the body.
+@app.post("/sql/schema")
+async def sql_schema(request: SchemaRequest):
+    return await asyncio.to_thread(sql_engine.schema, request.files)

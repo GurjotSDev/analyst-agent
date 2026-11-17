@@ -227,3 +227,95 @@ check("close deletes the uploads", not s.upload_dir.exists())
 
 import shutil
 shutil.rmtree(TEST_OUT, ignore_errors=True)
+
+# =============================================================================
+# Removing an upload (step 5b). Appended: the checks above are unchanged.
+# =============================================================================
+
+
+def csv_file(name: str, text: str) -> Path:
+    path = Path(tempfile.mkdtemp()) / name
+    path.write_text(text)
+    return path
+
+
+def upload_session(replies, approval=False) -> Session:
+    r = Session(Agent(llm=ScriptedLLM(replies), executor=executor, system_prompt="(test)",
+                      require_approval=approval), data_dir=config.DATA_DIR, output_dir=TEST_OUT)
+    r.new()
+    executor.execute("import cleaning\ncleaning.OUTPUT_DIR = cleaning.OUTPUT_DIR / 'evals' / 'ui-test'")
+    return r
+
+
+# Before any cleaning: gone from disk, the lists and the prompt.
+s = upload_session([])
+s.add_files([csv_file("a.csv", "x\n1\n"), csv_file("b.csv", "y\n2\n3\n")])
+check("remove: preview shows the last upload", s.preview and s.preview[0] == "b.csv", str(s.preview))
+check("remove: nothing removed yet", s.removed == set())
+said = s.remove_file("b.csv")
+check("remove: returns None when done", said is None, str(said))
+check("remove: deleted from disk", not (s.upload_dir / "b.csv").exists() and (s.upload_dir / "a.csv").exists())
+check("remove: gone from the file list", [f.split("/")[-1] for f in s.files] == ["a.csv"], str(s.files))
+check("remove: gone from the row and column counts", "b.csv" not in s.file_info and "b.csv" not in s.columns)
+check("remove: its preview is cleared", s.preview is None, str(s.preview))
+check("remove: the prompt no longer lists it", "b.csv" not in s.agent.history[0]["content"]
+      and "a.csv" in s.agent.history[0]["content"])
+check("remove: recorded", s.removed == {"b.csv"})
+check("remove: said in the chat", s.messages[-1]["content"] == "*Removed b.csv.*", s.messages[-1]["content"])
+check("remove: before any conversation, no note to the model", len(s.agent.history) == 1)
+s.remove_file("a.csv")
+check("remove: the other file's preview stays until it goes too", s.files == [] and s.preview is None)
+check("remove: an unknown name is refused", "isn't" in (s.remove_file("nope.csv") or ""), str(s.remove_file("nope.csv")))
+
+# Re-uploading a removed name brings it back.
+s.add_files([csv_file("b.csv", "y\n4\n")])
+check("re-upload: back in the list", [f.split("/")[-1] for f in s.files] == ["b.csv"] and s.file_info["b.csv"] == 1)
+check("re-upload: no longer recorded as removed", "b.csv" not in s.removed, str(s.removed))
+s.close()
+
+# Mid-conversation: the model is told.
+s = upload_session(["Hello."])
+s.add_files([csv_file("a.csv", "x\n1\n"), csv_file("b.csv", "y\n2\n")])
+list(s.send("hi"))
+s.remove_file("a.csv")
+check("remove mid-conversation: the model gets a [Files] note",
+      s.agent.history[-1] == {"role": "user", "content": "[Files] I removed a.csv. Don't load, clean or save it; "
+                                                          "ignore it if it's already loaded."},
+      str(s.agent.history[-1]))
+s.close()
+
+# While code waits for approval: refused, nothing deleted.
+s = upload_session(["```python\nprint(1)\n```"], approval=True)
+s.add_files([csv_file("a.csv", "x\n1\n")])
+list(s.send("go"))
+said = s.remove_file("a.csv")
+check("remove while code waits: refused", said and "waiting" in said and (s.upload_dir / "a.csv").exists()
+      and len(s.files) == 1, str(said))
+s.close()
+
+# After saving: the table leaves the downloads and sql_files().
+s = upload_session([])
+s.add_files([csv_file("keep.csv", "k\n1\n2\n"), csv_file("drop.csv", "d\n1\n2\n")])
+paths = {f.split("/")[-1]: f for f in s.files}
+s.agent.llm.replies = [
+    f"```python\nkeep = load('/data/{paths['keep.csv']}')\nsave_clean(keep)\n"
+    f"drop = load('/data/{paths['drop.csv']}')\nsave_clean(drop)\n```", "Saved both."]
+list(s.send("save both"))
+s.refresh()
+check("sql_files: this session's saved tables, as sandbox paths",
+      s.sql_files() == ["/output/clean/drop.csv", "/output/clean/keep.csv"], str(s.sql_files()))
+check("saved_tables: both", s.saved_tables == ["drop", "keep"], str(s.saved_tables))
+s.remove_file("drop.csv")
+s.refresh()
+names = sorted(p.name for p in s.downloads)
+check("remove after save: gone from the downloads", names == ["change_log.json", "cleaning_report.pdf",
+                                                             "data_dictionary.md", "keep.csv"], str(names))
+check("remove after save: gone from sql_files()", s.sql_files() == ["/output/clean/keep.csv"], str(s.sql_files()))
+s.remove_file("keep.csv")
+s.refresh()
+check("remove every saved file: no downloads, not even the reports", s.downloads == [] and s.sql_files() == [],
+      str(s.downloads))
+check("sql_files: a new session has none", (s.new() or s.sql_files()) == [])
+s.close()
+
+shutil.rmtree(TEST_OUT, ignore_errors=True)

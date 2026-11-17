@@ -80,6 +80,38 @@ class ExecutorClient:
         r.raise_for_status()
         return r.json()["kernel"]
 
+    def sql(self, query: str, files=()) -> dict:
+        """Run one read-only SQL query on the listed files (the executor's
+        /sql, see executor/sql.py). files are sandbox paths such as
+        /output/clean/expenses.csv; only they are tables. Like execute(),
+        never raises: a sandbox problem comes back as an error result the
+        model and the user can read."""
+        try:
+            # The server stops a query after 30 s; leave it time to say so.
+            r = self.http.post("/sql", json={"query": query, "files": list(files)}, timeout=90)
+        except httpx.HTTPError as e:
+            return _executor_failure(
+                f"The sandbox could not be reached ({type(e).__name__}). The query did not run. "
+                "Tell the user; they may need to restart it with docker compose up -d.")
+        if r.status_code >= 400:
+            return _executor_failure(f"The sandbox had an internal error (HTTP {r.status_code}) "
+                                     "while running this query. This is not a problem with your SQL.")
+        return r.json()
+
+    def schema(self, files=()) -> dict:
+        """The listed files' tables: {"tables": [{name, file, rows, columns}],
+        "problems": [...]} (problems: files not allowed, missing or unreadable).
+        On failure: no tables, and "error" saying why (never raises)."""
+        try:
+            # POST: the file list rides in the body.
+            r = self.http.post("/sql/schema", json={"files": list(files)}, timeout=90)
+            r.raise_for_status()
+            return r.json()
+        except (httpx.HTTPError, ValueError) as e:
+            return {"tables": [], "problems": [],
+                    "error": f"The sandbox could not be reached or failed ({type(e).__name__}); "
+                             "start it with docker compose up -d."}
+
     def kernel(self) -> int | None:
         """The number of the kernel running now, or None if the sandbox can't
         be reached. It goes up with every reset or restart; all clients share
@@ -174,3 +206,58 @@ def format_for_model(result: dict, max_chars: int) -> str:
     if result.get("status") == "timeout" and not result.get("error"):
         parts.append("The code took too long and was stopped.")
     return "\n\n".join(parts) or "(The code ran and printed nothing.)"
+
+# ---------------------------------------------------------------------------
+# Turning a SQL result into the text the MODEL reads
+# ---------------------------------------------------------------------------
+
+SQL_ROWS_FOR_MODEL = 50     # the UI shows up to 200; the model needs far fewer
+SQL_CHARS_FOR_MODEL = 3000
+
+
+def _cell(value) -> str:
+    """One value in a Markdown table. Numbers keep their full precision (str
+    of a float is its shortest exact form), because the number check compares
+    the model's answer with these digits. A | or line break inside a value
+    would break the table, so they're escaped or flattened."""
+    if value is None:
+        return "NULL"
+    return " ".join(str(value).split("\n")).replace("|", "\\|")
+
+
+def format_sql_for_model(result: dict, max_rows: int = SQL_ROWS_FOR_MODEL,
+                         max_chars: int = SQL_CHARS_FOR_MODEL) -> str:
+    """A /sql result as plain text for the model: a count line, then a
+    Markdown table of the first rows. Rows are added until max_rows or
+    max_chars is reached, and the count line says how many were shown, so
+    the model never mistakes the first 50 rows for all of them."""
+    status = result.get("status")
+    if status != "ok":
+        message = (result.get("error") or "").strip() or "(no message)"
+        if status == "refused" or message.startswith("Refused"):
+            return message if message.startswith("Refused") else f"Refused: {message}"
+        if status == "timeout":
+            return f"Timeout: {message}"
+        return f"Error:\n{message}"
+
+    columns, rows = result.get("columns") or [], result.get("rows") or []
+    count = result.get("row_count", len(rows))
+    if count == 0 or not columns:
+        return "0 rows: the query matched nothing."
+
+    lines = ["| " + " | ".join(_cell(c) for c in columns) + " |",
+             "|" + "---|" * len(columns)]
+    size = sum(len(line) + 1 for line in lines) + 60   # room for the count line
+    shown = 0
+    for row in rows[:max_rows]:
+        line = "| " + " | ".join(_cell(v) for v in row) + " |"
+        if size + len(line) + 1 > max_chars and shown:
+            break
+        lines.append(line)
+        size += len(line) + 1
+        shown += 1
+
+    total = f"more than {count:,} rows" if not result.get("count_exact", True) else \
+            f"{count:,} row{'' if count == 1 else 's'}"
+    which = "all shown" if shown == count else f"first {shown} shown"
+    return f"{total} ({which})\n" + "\n".join(lines)

@@ -106,3 +106,23 @@ r = execute("print(x)")
 check("reset clears state", r["status"] == "error" and "NameError" in (r["error"] or ""))
 r = execute("print(callable(profile))")
 check("helpers back after reset", r["stdout"].strip() == "True")
+# 10. Read-only SQL on the cleaned tables (sql.py), separate from the kernel.
+# Each call names its files (POST, so the list rides in the body); no list
+# means no tables. The file below is written by the kernel, as save_clean would.
+execute("import pathlib; pathlib.Path('/output/clean').mkdir(parents=True, exist_ok=True); "
+        "pathlib.Path('/output/clean/zz_route_check.csv').write_text('n\\n1\\n2\\n')")
+FILES = ["/output/clean/zz_route_check.csv"]
+schema = httpx.post(f"{BASE}/sql/schema", json={"files": FILES}, timeout=60).json()
+check("sql schema: only the listed file", [t["name"] for t in schema.get("tables", [])] == ["zz_route_check"]
+      and schema.get("problems") == [], str(schema)[:200])
+schema = httpx.post(f"{BASE}/sql/schema", json={}, timeout=60).json()
+check("sql schema: no files -> no tables", schema.get("tables") == [], str(schema)[:200])
+r = httpx.post(f"{BASE}/sql", json={"query": "SELECT SUM(n) AS s FROM zz_route_check", "files": FILES}, timeout=60).json()
+check("sql select on a listed file", r["status"] == "ok" and r["rows"] == [[3]], str(r))
+r = httpx.post(f"{BASE}/sql", json={"query": "SELECT 41 + 1 AS answer"}, timeout=60).json()
+check("sql select", r["status"] == "ok" and r["columns"] == ["answer"] and r["rows"] == [[42]], str(r))
+r = httpx.post(f"{BASE}/sql", json={"query": "CREATE TABLE x AS SELECT 1", "files": FILES}, timeout=60).json()
+check("sql refuses writes", r["status"] == "refused", str(r.get("error")))
+execute("import pathlib; pathlib.Path('/output/clean/zz_route_check.csv').unlink()")
+r = httpx.post(f"{BASE}/sql", json={"query": "SELECT x FROM"}, timeout=60).json()
+check("sql syntax error comes back", r["status"] == "error" and "Parser" in (r["error"] or ""), str(r.get("error")))

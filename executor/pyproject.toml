@@ -5,6 +5,7 @@ description = "Sandboxed Python executor and data-cleaning helpers"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "duckdb>=2.0.0",
     "fastapi>=0.143.1",
     "fpdf2>=2.9.0",
     "ipykernel>=7.4.0",

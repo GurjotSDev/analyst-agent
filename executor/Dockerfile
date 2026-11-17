@@ -24,7 +24,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock .python-version ./
 RUN uv sync --locked --no-dev
 
-COPY server.py analyst_helpers.py cleaning.py report.py ./
+COPY server.py sql.py analyst_helpers.py cleaning.py report.py ./
 
 # DATA_DIR / OUTPUT_DIR are where compose.yaml mounts the data/ and output/ folders.
 ENV PATH="/app/.venv/bin:$PATH" \

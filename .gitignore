@@ -2,6 +2,7 @@
 data/
 output/
 CLAUDE.md
+obsidian_vault/
 
 # --- Python virtual environments (rebuilt by `uv sync`) ---
 .venv/

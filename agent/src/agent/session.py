@@ -4,6 +4,8 @@ One cleanup conversation, as the web UI shows it. No Gradio in here.
 The Agent produces events (ModelReply, NeedsApproval, CodeResult, Notice,
 TurnDone). A Session turns them into chat messages and remembers what the UI
 needs to show: the conversation, and the code waiting for approval, if any.
+The event -> chat-message code lives in ChatDisplay, which the Ask questions
+tab's AskSession (sql_session.py) shares.
 ui.py only draws a Session; keeping the logic here means it can be tested
 with a scripted model and the real sandbox, without a browser.
 
@@ -23,9 +25,10 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 from . import config
-from .codeblocks import CODE_BLOCK
+from .codeblocks import block_pattern
 from .executor import ExecutorClient
 from .llm import OllamaLLM
 from .loop import Agent, CodeResult, ModelReply, NeedsApproval, Notice, TurnDone
@@ -101,8 +104,106 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", Path(name).name).lstrip(".") or "file.csv"
 
 
+class ChatDisplay:
+    """Turns an agent's events into chat messages. Shared by Session (the Clean
+    tab) and AskSession (the Ask questions tab, sql_session.py), so both draw
+    replies, notes, errors and the "Thinking…" spinner the same way.
+
+    A class using it has self.agent, self.messages and self._working, and
+    can change what differs between the tabs:
+      - running_title: the spinner's title while a block runs
+      - _result_title(result) and _describe_result(code, result): how a
+        result is shown (python output, or a query and its rows)
+      - _add(event): to handle more events (Session's NeedsApproval)
+      - _on_error(): what to reset when the turn fails"""
+
+    running_title: ClassVar[str] = "Running the code…"
+
+    def _show(self, events, working: str = "Thinking…") -> Iterator[None]:
+        """Turn the agent's events into chat messages, redrawing after each.
+        While the agent works (the model can take minutes, and nothing else
+        moves on screen), a "Thinking…" or "Running the code…" message with a
+        spinner sits at the bottom of the chat, so it never looks stuck."""
+        self._set_working(working)
+        yield
+        try:
+            for event in events:
+                self._set_working(None)
+                self._add(event)
+                self._set_working(self._next_step(event))
+                yield
+        except Exception as e:
+            # A failure (Ollama stopped, sandbox down) is shown in the chat,
+            # and the session stays usable.
+            self._set_working(None)
+            self._on_error()
+            self._say(f"**Error:** {type(e).__name__}: {e}")
+            yield
+        if self._working is not None:
+            self._set_working(None)
+            yield
+
+    def _set_working(self, title: str | None) -> None:
+        """Show, change or remove the placeholder message. Gradio draws
+        metadata status "pending" as a spinner next to the title."""
+        if self._working is not None and self._working in self.messages:
+            self.messages.remove(self._working)
+        self._working = None
+        if title:
+            self._working = {"role": "assistant", "content": "",
+                             "metadata": {"title": title, "status": "pending"}}
+            self.messages.append(self._working)
+
+    def _add(self, event) -> None:
+        match event:
+            case ModelReply(text=text):
+                # The code is shown separately (with its result, and for the
+                # Clean tab beside the buttons while it waits), so the
+                # reply's own copy is left out.
+                shown = _plain_arrows(block_pattern(self.agent.block_lang).sub("", text).strip())
+                if shown:
+                    self._say(shown)
+            case CodeResult(code=code, result=result):
+                self._say(self._describe_result(code, result), title=self._result_title(result))
+            case Notice(text=text):
+                self._say(f"*Note: {text}*")
+            case TurnDone(reason="declined"):
+                self._say("*The code was not run.*")
+            case _:
+                pass
+
+    def _say(self, content: str, title: str | None = None) -> None:
+        message = {"role": "assistant", "content": content}
+        if title:
+            message["metadata"] = {"title": title}   # Gradio draws this as a collapsible section
+        self.messages.append(message)
+
+    def _next_step(self, event) -> str | None:
+        """What the agent does after this event, for the placeholder's title.
+        None: nothing; the turn is over or waits for the user."""
+        match event:
+            case ModelReply(text=text):
+                # A reply with a block runs next (auto mode) or waits for approval.
+                if block_pattern(self.agent.block_lang).search(text):
+                    return None if self.agent.require_approval else self.running_title
+                return None
+            case NeedsApproval() | TurnDone():
+                return None
+            case _:   # a result or a note: the model reads it and replies
+                return "Thinking…"
+
+    def _on_error(self) -> None:
+        self.agent.pending_code = None
+
+    def _result_title(self, result: dict) -> str:
+        raise NotImplementedError
+
+    def _describe_result(self, code: str, result: dict) -> str:
+        raise NotImplementedError
+
+
 @dataclass
-class Session:
+class Session(ChatDisplay):
     agent: Agent
     messages: list[dict] = field(default_factory=list)
     pending_code: str | None = None     # code waiting for Run it / Don't run
@@ -115,6 +216,8 @@ class Session:
     file_info: dict[str, int] = field(default_factory=dict)  # upload name -> data rows
     columns: dict[str, int] = field(default_factory=dict)    # upload name -> columns
     preview: tuple[str, list[str], list[list[str]]] | None = None  # (name, header, rows) of the last upload
+    removed: set[str] = field(default_factory=set)       # upload names removed this session
+    saved_tables: list[str] = field(default_factory=list)  # saved this session, not removed (set by refresh)
     _working: dict | None = None         # the "Thinking…" message while the bot works
 
     @property
@@ -179,6 +282,7 @@ class Session:
             except OSError:
                 pass
         if added or replaced:
+            self.removed -= set(added + replaced)   # uploaded again: it's back
             prefix = f"uploads/{self.session_id}/"
             self.files = sorted(set(self.files) | {prefix + n for n in added})
             self._update_prompt()
@@ -190,6 +294,36 @@ class Session:
                     f"Load a replaced file again if you already loaded it."})
             self._say(f"*{said[0].upper() + said[1:]}.*")
         return added + replaced
+
+    def remove_file(self, name: str) -> str | None:
+        """Delete one upload. Returns None when done, or why it wasn't.
+
+        If it was already cleaned and saved, refresh() then drops its table
+        from the downloads and from sql_files() (so from the Ask tab too).
+        The cleaned CSV stays on disk, unseen: deleting it is out of reach
+        here (output/ is read-only in the UI container) and not needed."""
+        if self.pending_code is not None:
+            return "Run or decline the waiting code first, then remove the file."
+        if name not in self.file_info or self.upload_dir is None:
+            return f"{name} isn't one of this session's uploads."
+        (self.upload_dir / name).unlink(missing_ok=True)
+        self.files = [f for f in self.files if f.split("/")[-1] != name]
+        self.file_info.pop(name, None)
+        self.columns.pop(name, None)
+        if self.preview and self.preview[0] == name:
+            self.preview = None
+        self.removed.add(name)
+        self._update_prompt()
+        if len(self.agent.history) > 1:   # mid-conversation: tell the model too
+            self.agent.history.append({"role": "user", "content":
+                f"[Files] I removed {name}. Don't load, clean or save it; ignore it if it's already loaded."})
+        self._say(f"*Removed {name}.*")
+        return None
+
+    def sql_files(self) -> list[str]:
+        """This session's saved, not-removed cleaned tables, as sandbox paths
+        for the Ask tab (/output/clean/<table>.csv). Current as of refresh()."""
+        return [f"/output/clean/{t}.csv" for t in self.saved_tables]
 
     def refresh(self) -> None:
         """Read the change log and saved tables from the sandbox."""
@@ -204,10 +338,15 @@ class Session:
         mine = (lambda t: f"uploads/{self.session_id}/" in state["sources"].get(t, "")) \
             if self.data_dir is not None else (lambda t: True)
         self.log_rows = [row[:5] + [_example(row)] for row in state["log"] if mine(row[1])]
+        # A table cleaned from an upload that was removed since: it stays in
+        # the kernel and on disk, but leaves the downloads and the Ask tab.
+        gone = tuple(f"uploads/{self.session_id}/{n}" for n in self.removed)
+        removed = lambda t: bool(gone) and state["sources"].get(t, "").replace("\\", "/").endswith(gone)  # noqa: E731
+        self.saved_tables = [t for t in state["saved"] if mine(t) and not removed(t)]
         if self.output_dir is None:
             return
         clean = self.output_dir / "clean"
-        saved = [t for t in state["saved"] if mine(t)]
+        saved = self.saved_tables
         names = [f"{t}.csv" for t in saved] + (REPORT_FILES if saved else [])
         self.downloads = [clean / n for n in names if (clean / n).exists()]
 
@@ -233,6 +372,7 @@ class Session:
         self.files = []
         self.file_info, self.columns, self.preview = {}, {}, None
         self.log_rows, self.downloads = [], []
+        self.removed, self.saved_tables = set(), []
         self._update_prompt()
         self.agent.new_analysis()
         self.messages = []
@@ -250,70 +390,25 @@ class Session:
         if self.agent.history:
             self.agent.history[0] = {"role": "system", "content": self.agent.system_prompt}
 
-    # --- Events -> chat messages --------------------------------------------
-
-    def _show(self, events, working: str = "Thinking…") -> Iterator[None]:
-        """Turn the agent's events into chat messages, redrawing after each.
-        While the agent works (the model can take minutes, and nothing else
-        moves on screen), a "Thinking…" or "Running the code…" message with a
-        spinner sits at the bottom of the chat, so it never looks stuck."""
-        self._set_working(working)
-        yield
-        try:
-            for event in events:
-                self._set_working(None)
-                self._add(event)
-                self._set_working(_next_step(event, self.agent.require_approval))
-                yield
-        except Exception as e:
-            # A failure (Ollama stopped, sandbox down) is shown in the chat,
-            # and the session stays usable.
-            self._set_working(None)
-            self.pending_code = None
-            self.agent.pending_code = None
-            self._say(f"**Error:** {type(e).__name__}: {e}")
-            yield
-        if self._working is not None:
-            self._set_working(None)
-            yield
-
-    def _set_working(self, title: str | None) -> None:
-        """Show, change or remove the placeholder message. Gradio draws
-        metadata status "pending" as a spinner next to the title."""
-        if self._working is not None and self._working in self.messages:
-            self.messages.remove(self._working)
-        self._working = None
-        if title:
-            self._working = {"role": "assistant", "content": "",
-                             "metadata": {"title": title, "status": "pending"}}
-            self.messages.append(self._working)
+    # --- Events -> chat messages (see ChatDisplay) ---------------------------
 
     def _add(self, event) -> None:
-        match event:
-            case ModelReply(text=text):
-                # The code is shown separately (beside the buttons while it
-                # waits, then with its result), so the reply's own copy is left out.
-                shown = _plain_arrows(CODE_BLOCK.sub("", text).strip())
-                if shown:
-                    self._say(shown)
-            case NeedsApproval(code=code):
-                # Shown in the code panel beside Run it / Don't run, not in the
-                # chat: one copy, right where the decision is made.
-                self.pending_code = code
-            case CodeResult(code=code, result=result):
-                self._say(_describe_result(code, result), title=_result_title(result))
-            case Notice(text=text):
-                self._say(f"*Note: {text}*")
-            case TurnDone(reason="declined"):
-                self._say("*The code was not run.*")
-            case TurnDone():
-                pass
+        if isinstance(event, NeedsApproval):
+            # Shown in the code panel beside Run it / Don't run, not in the
+            # chat: one copy, right where the decision is made.
+            self.pending_code = event.code
+        else:
+            super()._add(event)
 
-    def _say(self, content: str, title: str | None = None) -> None:
-        message = {"role": "assistant", "content": content}
-        if title:
-            message["metadata"] = {"title": title}   # Gradio draws this as a collapsible section
-        self.messages.append(message)
+    def _on_error(self) -> None:
+        self.pending_code = None
+        super()._on_error()
+
+    def _result_title(self, result: dict) -> str:
+        return _result_title(result)
+
+    def _describe_result(self, code: str, result: dict) -> str:
+        return _describe_result(code, result)
 
 
 def _result_title(result: dict) -> str:
@@ -331,21 +426,6 @@ LATEX_ARROW = re.compile(r"\$\s*\\(?:rightarrow|to|longrightarrow)\s*\$")
 
 def _plain_arrows(text: str) -> str:
     return LATEX_ARROW.sub("→", text)
-
-
-def _next_step(event, require_approval: bool) -> str | None:
-    """What the agent does after this event, for the placeholder's title.
-    None: nothing; the turn is over or waits for the user."""
-    match event:
-        case ModelReply(text=text):
-            # A reply with code runs next (auto mode) or waits for approval.
-            if CODE_BLOCK.search(text):
-                return None if require_approval else "Running the code…"
-            return None
-        case NeedsApproval() | TurnDone():
-            return None
-        case _:   # a result or a note: the model reads it and replies
-            return "Thinking…"
 
 
 def _describe_result(code: str, result: dict) -> str:

@@ -251,6 +251,75 @@ def staffing() -> None:
           ["entry_id", "contractor_id", "week_start", "hours", "project"], sheets)
 
 
+# ---------------------------------------------------------------------------
+# SQL eval: three known-clean tables for the Ask-questions agent
+# ---------------------------------------------------------------------------
+# These go to output/clean/sql_eval/, not data/eval/: the SQL engine only
+# opens files inside output/clean/ or data/uploads/ (see executor/sql.py).
+# A sub-folder of output/clean/ because:
+#   - a real session saves flat files (output/clean/<table>.csv), so a
+#     sub-folder can't collide with one, and every session sends its own
+#     file list, so no session ever sees these tables;
+#   - nothing deletes inside output/clean/, while data/uploads/ is emptied
+#     by every UI start and New session, which could happen mid-run.
+# Nothing here is planted: the questions are answered from clean data, and
+# the answers are computed with pandas by the harness (sql_scenario.py).
+SQL_OUT = Path(__file__).resolve().parents[2] / "output" / "clean" / "sql_eval"
+
+# (department, how many employees, salary range). Built so the two readings
+# of "which department pays the most?" disagree: Engineering has the
+# largest TOTAL (many people), Finance the highest AVERAGE (few, well paid).
+DEPARTMENTS = [("Engineering", 14, (85_000, 105_000)), ("Sales", 10, (60_000, 80_000)),
+               ("Operations", 7, (55_000, 70_000)), ("Marketing", 5, (65_000, 85_000)),
+               ("Finance", 4, (120_000, 140_000))]
+MONTH_COUNTS = [46, 52, 38, 61, 49, 55]   # expenses per month, Jan-Jun 2025. All above 31,
+                                          # so a count can't be mistaken for a day number
+
+
+def sql_eval() -> None:
+    rng = random.Random(606)
+    names = rng.sample([f"{f} {l}" for f in FIRST for l in LAST], 40)   # 40 different names
+    employees = []
+    for dept, count, (low, high) in DEPARTMENTS:
+        for _ in range(count):
+            n = len(employees)
+            employees.append([1001 + n, names[n], dept,
+                              day(rng, date(2018, 1, 1), date(2024, 12, 31)).isoformat(),
+                              rng.randrange(low, high, 500)])
+
+    # 34 of the 40 employees have expenses; 6 have none, so "average spend
+    # per employee" has two readings that differ (over 34 or over 40).
+    spenders = sorted(rng.sample([e[0] for e in employees], 34))
+    categories = ["Travel", "Meals", "Software", "Training", "Office Supplies"]
+    expenses = []
+    for month, count in enumerate(MONTH_COUNTS, start=1):
+        for _ in range(count):
+            expenses.append([9001 + len(expenses), rng.choice(spenders),
+                             date(2025, month, rng.randint(1, 28)).isoformat(),
+                             rng.choice(categories), round(rng.uniform(8, 900), 2)])
+    for i, e in enumerate(spenders[:34]):   # every spender really has one (a random pick could miss)
+        if not any(x[1] == e for x in expenses):
+            expenses[i][1] = e
+    # "Top 3 by total expenses" must have one right answer: no tie at 3rd/4th.
+    totals = sorted((sum(x[4] for x in expenses if x[1] == e) for e in spenders), reverse=True)
+    assert totals[2] - totals[3] > 50 and totals[0] > totals[1] > totals[2], totals[:4]
+
+    projects = ["Apollo", "Borealis", "Cobalt", "Delta"]
+    mondays = [date(2025, 1, 6) + timedelta(weeks=w) for w in range(26)]
+    staff = [e[0] for e in employees if e[2] in ("Engineering", "Operations")]
+    timesheets = []
+    for _ in range(160):
+        timesheets.append([7001 + len(timesheets), rng.choice(staff), rng.choice(mondays).isoformat(),
+                           rng.choice(projects), rng.choice([8, 12, 16, 20, 24, 32, 40])])
+
+    write(SQL_OUT / "employees.csv", ["employee_id", "name", "department", "hire_date", "salary"],
+          employees)
+    write(SQL_OUT / "expenses.csv", ["expense_id", "employee_id", "expense_date", "category", "amount"],
+          expenses)
+    write(SQL_OUT / "timesheets.csv", ["entry_id", "employee_id", "week_start", "project", "hours"],
+          timesheets)
+
+
 if __name__ == "__main__":
     print(f"Writing fake eval datasets to {OUT}")
     retail()
@@ -258,3 +327,5 @@ if __name__ == "__main__":
     shipments()
     clean()
     staffing()
+    print(f"Writing the SQL eval's clean tables to {SQL_OUT}")
+    sql_eval()

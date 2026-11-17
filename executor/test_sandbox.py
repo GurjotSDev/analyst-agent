@@ -71,3 +71,23 @@ check("memory limit", r["status"] == "error" and r["kernel_restarted"] and secon
       f"{seconds:.0f}s, status={r['status']}, {(r['error'] or '')[:60]}")
 r = execute("print('alive')")
 check("usable after memory test", r["stdout"].strip() == "alive", repr(r["stdout"]))
+
+# SQL (sql.py): a SELECT can't read or write files either, in the real container.
+def sql(query: str, files=()) -> dict:
+    return httpx.post(f"{BASE}/sql", json={"query": query, "files": list(files)}, timeout=60).json()
+
+r = sql("SELECT * FROM read_csv('/etc/passwd')")
+check("sql can't read other files", r["status"] == "error" and "disabled" in (r["error"] or ""), str(r.get("error"))[:80])
+r = sql("SELECT * FROM read_csv('/data/*.csv')")
+check("sql can't read the raw data", r["status"] == "error" and "disabled" in (r["error"] or ""), str(r.get("error"))[:80])
+r = sql("COPY (SELECT 1) TO '/output/leak.csv'")
+check("sql can't write files", r["status"] == "refused", str(r.get("error"))[:80])
+r = sql("SET enable_external_access = true")
+check("sql can't switch file access back on", r["status"] == "refused", str(r.get("error"))[:80])
+# A file outside output/clean/ and data/uploads/ is reported, never loaded.
+s = httpx.post(f"{BASE}/sql/schema", json={"files": ["/etc/passwd", "/output/clean/../../etc/passwd.csv",
+                                                       "/data/employees.csv"]}, timeout=60).json()
+check("sql won't load files outside the allowed folders", s["tables"] == [] and len(s["problems"]) == 3
+      and all("not allowed" in p for p in s["problems"]), str(s)[:160])
+r = sql("SELECT * FROM passwd", ["/etc/passwd"])
+check("sql: a refused file is not a table", r["status"] == "error", str(r.get("error"))[:80])
