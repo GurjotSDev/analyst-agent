@@ -3,9 +3,6 @@ name = "agent"
 version = "0.1.0"
 description = "Local data-cleaning agent with a Gradio UI"
 readme = "README.md"
-authors = [
-    { name = "GurjotSDev", email = "" }
-]
 requires-python = ">=3.14"
 dependencies = [
     "httpx>=0.28.1",
